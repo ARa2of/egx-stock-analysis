@@ -27,7 +27,7 @@ jobs:
 
     - name: Run stock analysis
       run: |
-        python egx_stock_analysis_3.py
+        python egx_stock_analysis.py
 
     - name: Commit and push updated Excel file
       run: |
