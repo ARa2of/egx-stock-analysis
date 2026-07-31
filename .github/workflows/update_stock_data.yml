@@ -1,21 +1,27 @@
 # .github/workflows/update_stock_data.yml
 name: Update Stock Analysis - Daily at 5 PM Egypt Time
 
+# ✅ Add these permissions at the top level
+permissions:
+  contents: write
+  pull-requests: read
+
 on:
   schedule:
     - cron: '0 15 * * *'  # 5 PM Egypt Time (3 PM UTC)
-  workflow_dispatch:      # Keep manual trigger
+  workflow_dispatch:
 
 jobs:
   update-analysis:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Update checkout action from v3 to v4
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        # ✅ This is important - it ensures we can push back
+        persist-credentials: true
 
-    # 2. Update setup-python action from v4 to v5
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
