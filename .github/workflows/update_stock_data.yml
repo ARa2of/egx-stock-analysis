@@ -3,34 +3,32 @@ name: Update Stock Analysis - Daily at 5 PM Egypt Time
 
 on:
   schedule:
-    # Runs at 5 PM Egypt Time (3 PM UTC) every day
-    # Egypt is UTC+2, so 5 PM Egypt = 3 PM UTC
-    - cron: '0 15 * * *'
-  
-  # Allow manual trigger from GitHub
-  workflow_dispatch:
+    - cron: '0 15 * * *'  # 5 PM Egypt Time (3 PM UTC)
+  workflow_dispatch:      # Keep manual trigger
 
 jobs:
   update-analysis:
     runs-on: ubuntu-latest
-    
+
     steps:
+    # 1. Update checkout action from v3 to v4
     - name: Checkout repository
-      uses: actions/checkout@v3
-    
+      uses: actions/checkout@v4
+
+    # 2. Update setup-python action from v4 to v5
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-    
+
     - name: Install dependencies
       run: |
         pip install pandas numpy yfinance openpyxl tradingview-ta
-    
+
     - name: Run stock analysis
       run: |
         python egx_stock_analysis_3.py
-    
+
     - name: Commit and push updated Excel file
       run: |
         git config --local user.email "action@github.com"
