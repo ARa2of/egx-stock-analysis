@@ -1,24 +1,25 @@
-# -*- coding: utf-8 -*-
+# telegram_bot_full_github.py
 """
-Created on Sat Aug  1 02:44:30 2026
+Telegram Bot for EGX Stock Analysis - Full Version (GitHub Edition)
+===================================================================
 
-@author: Ahmad
-"""
-
-# telegram_bot_final.py
-"""
-Telegram Bot for EGX Stock Analysis
-===================================
+Displays ALL columns from your Stock_Analysis Excel sheet.
 Reads Excel file from GitHub (updated daily at 5 PM Egypt Time)
+
+Installation:
+    pip install python-telegram-bot pandas openpyxl requests
+
+Run:
+    python telegram_bot_full_github.py
 """
 
 import logging
 import sys
 import io
 import os
-import requests
-import pandas as pd
 from datetime import datetime
+import pandas as pd
+import requests
 from typing import Optional, Dict, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,7 +45,7 @@ if not BOT_TOKEN:
     print("❌ ERROR: BOT_TOKEN environment variable not set!")
     print("Set it with: export BOT_TOKEN=your_token_here")
     sys.exit(1)
-    
+
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,12 +58,56 @@ cached_data = None
 cache_timestamp = None
 CACHE_DURATION = 300  # 5 minutes cache
 
+# Column name mapping for display (updated for new columns)
+COLUMN_DISPLAY = {
+    "Selected Stock": "📊 Stock",
+    "Data As Of": "📅 Data Date",
+    "Current EGP Price": "💰 EGP Price",
+    "Current USD Price": "💵 USD Price",
+    "Historical Min USD Price": "📉 Min USD",
+    "Historical Max USD Price": "📈 Max USD",
+    "Undervalued (Yes/No)": "💎 Undervalued",
+    "1-Year Avg Volume": "📊 1Y Avg Vol",
+    "Last Day Volume": "📊 Last Vol",
+    "Volume Multiplier (vs 1Y)": "📊 Vol Multiplier",
+    "Est. Buy Volume (2-Month Avg)": "📊 Buy Vol Avg",
+    "Est. Buy Volume (Last Day)": "📊 Buy Vol Last",
+    "Buy Volume Multiplier (vs 2-Month)": "📊 Buy Vol Multiplier",
+    "Support": "📉 Support",
+    "Resistance": "📈 Resistance",
+    "50 SMA": "📈 50 SMA",
+    "200 SMA": "📈 200 SMA",
+    "Golden Cross (Yes/No)": "⭐ Golden Cross",
+    "Death Cross (Yes/No)": "💀 Death Cross",
+    "50 EMA": "📈 50 EMA",
+    "200 EMA": "📈 200 EMA",
+    "EMA Bullish (50>200) (Yes/No)": "📈 EMA Bullish",
+    "RSI (%)": "📊 RSI",
+    "VWMA": "📊 VWMA",  # New column
+    "TA Data As Of": "🕐 TA Data",  # New column
+    "Optimal Entry Price": "🎯 Entry",
+    "Stop Loss": "🛑 Stop Loss",
+    "Stop Loss Basis": "📝 Stop Basis",
+    "Take Profit 1": "🏆 TP1",
+    "Take Profit 2": "🏆 TP2",
+    "Take Profit 3": "🏆 TP3",
+    "Take Profit Basis": "📝 TP Basis",
+    "TP1 Risk/Reward": "📊 TP1 RR",
+    "TP2 Risk/Reward": "📊 TP2 RR",
+    "TP3 Risk/Reward": "📊 TP3 RR",
+    "TP1 Reward %": "📊 TP1 %",
+    "TP2 Reward %": "📊 TP2 %",
+    "TP3 Reward %": "📊 TP3 %",
+    "Recommendation": "🎯 Recommendation",
+    "Recommendation Basis": "📝 Basis",
+}
+
 # --------------------------------------------------------------------------
-# Excel Reader Functions
+# Excel Reader Functions (GitHub Version)
 # --------------------------------------------------------------------------
 
 def read_analysis_data() -> Optional[pd.DataFrame]:
-    """Read the Stock_Analysis sheet from GitHub (with local fallback)."""
+    """Read the Stock_Analysis sheet from GitHub with caching."""
     global cached_data, cache_timestamp
     
     # Return cached data if fresh
@@ -72,14 +117,13 @@ def read_analysis_data() -> Optional[pd.DataFrame]:
             return cached_data
     
     try:
-        # Try GitHub first
+        # Fetch from GitHub
         logger.info("📥 Fetching data from GitHub...")
         response = requests.get(GITHUB_RAW_URL, timeout=10)
         
         if response.status_code == 404:
-            logger.warning("⚠️ File not found on GitHub. Has the workflow run yet?")
-            # Fallback to local
-            return read_local_file()
+            logger.error(f"❌ File not found on GitHub: {GITHUB_RAW_URL}")
+            return None
         
         response.raise_for_status()
         
@@ -91,36 +135,31 @@ def read_analysis_data() -> Optional[pd.DataFrame]:
         
         logger.info(f"✅ Loaded {len(df)} stocks from GitHub")
         
+        # Check for required columns
+        required_cols = ["Selected Stock", "Recommendation"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            logger.warning(f"⚠️ Missing columns: {missing_cols}")
+        
         # Cache the data
         cached_data = df
         cache_timestamp = datetime.now()
         return df
         
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Network error: {e}")
+        return None
     except Exception as e:
-        logger.warning(f"⚠️ GitHub read failed: {e}")
-        return read_local_file()
-
-def read_local_file() -> Optional[pd.DataFrame]:
-    """Fallback to local Excel file."""
-    try:
-        logger.info("📥 Falling back to local file...")
-        df = pd.read_excel(LOCAL_EXCEL_FILE, sheet_name="Stock_Analysis")
-        logger.info(f"✅ Loaded {len(df)} stocks from local file")
-        
-        cached_data = df
-        cache_timestamp = datetime.now()
-        return df
-        
-    except Exception as e2:
-        logger.error(f"❌ Both GitHub and local failed: {e2}")
+        logger.error(f"❌ Error reading Excel: {e}")
         return None
 
 def get_stock_data(ticker: str) -> Optional[Dict[str, Any]]:
-    """Get data for a specific ticker."""
+    """Get data for a specific ticker from the Excel file."""
     df = read_analysis_data()
     if df is None or df.empty:
         return None
     
+    # Find the row for this ticker
     mask = df["Selected Stock"].str.upper() == ticker.upper()
     if not mask.any():
         return None
@@ -147,14 +186,23 @@ def format_number(val, decimals=2):
         return str(val)
 
 def format_stock_response(data: Dict[str, Any]) -> str:
-    """Format stock data for Telegram display."""
+    """Format ALL stock data for Telegram display."""
+    
+    # Recommendation emoji
     rec = data.get("Recommendation", "Hold")
-    emoji_map = {"Buy": "🟢", "Watch": "🟡", "Hold": "🔵", "Avoid": "🔴"}
+    emoji_map = {
+        "Buy": "🟢",
+        "Watch": "🟡",
+        "Hold": "🔵",
+        "Avoid": "🔴"
+    }
     emoji = emoji_map.get(rec, "⚪")
     
+    # Undervalued emoji
     undervalued = data.get("Undervalued (Yes/No)", "No")
     undervalued_emoji = "✅" if undervalued == "Yes" else "❌"
     
+    # Cross emojis
     golden = data.get("Golden Cross (Yes/No)", "No")
     golden_emoji = "✅" if golden == "Yes" else "❌"
     
@@ -164,6 +212,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
     ema_bullish = data.get("EMA Bullish (50>200) (Yes/No)", "No")
     ema_emoji = "✅" if ema_bullish == "Yes" else "❌"
     
+    # SMA50 > SMA200 check
     sma50 = data.get("50 SMA")
     sma200 = data.get("200 SMA")
     sma_bullish = "✅" if (sma50 and sma200 and sma50 > sma200) else "❌"
@@ -172,6 +221,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"📊 *{data.get('Selected Stock', 'Unknown')}*",
         f"{'=' * 30}",
         f"📅 *Data:* {data.get('Data As Of', 'N/A')}",
+        f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
         "",
         f"{emoji} *RECOMMENDATION:* {rec}",
         f"📝 *Basis:* {data.get('Recommendation Basis', 'N/A')[:150]}...",
@@ -193,6 +243,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • 200 EMA: {format_number(data.get('200 EMA'))}",
         f"  • {ema_emoji} EMA Bullish (50>200): {ema_bullish}",
         f"  • RSI: {format_number(data.get('RSI (%)'))}",
+        f"  • VWMA: {format_number(data.get('VWMA'))}",  # New VWMA line
         "",
         f"📊 *SUPPORT/RESISTANCE:*",
         f"  • Support: {format_number(data.get('Support'))}",
@@ -209,31 +260,39 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🎯 *TRADE SETUP:*",
         f"  • Entry: {format_number(data.get('Optimal Entry Price'))}",
         f"  • Stop Loss: {format_number(data.get('Stop Loss'))}",
+        f"  • Stop Basis: {data.get('Stop Loss Basis', 'N/A')[:80]}...",
         "",
         f"🏆 *TAKE PROFIT TARGETS:*",
     ]
     
+    # TP1
     tp1 = data.get('Take Profit 1')
     tp1_rr = data.get('TP1 Risk/Reward')
     tp1_pct = data.get('TP1 Reward %')
     if tp1 and not pd.isna(tp1):
         lines.append(f"  • TP1: {format_number(tp1)}  | RR: {format_number(tp1_rr)}x  | +{format_number(tp1_pct)}%")
     
+    # TP2
     tp2 = data.get('Take Profit 2')
     tp2_rr = data.get('TP2 Risk/Reward')
     tp2_pct = data.get('TP2 Reward %')
     if tp2 and not pd.isna(tp2):
         lines.append(f"  • TP2: {format_number(tp2)}  | RR: {format_number(tp2_rr)}x  | +{format_number(tp2_pct)}%")
     
+    # TP3
     tp3 = data.get('Take Profit 3')
     tp3_rr = data.get('TP3 Risk/Reward')
     tp3_pct = data.get('TP3 Reward %')
     if tp3 and not pd.isna(tp3):
         lines.append(f"  • TP3: {format_number(tp3)}  | RR: {format_number(tp3_rr)}x  | +{format_number(tp3_pct)}%")
     
+    if tp1 and not pd.isna(tp1):
+        lines.append(f"  📝 TP Basis: {data.get('Take Profit Basis', 'N/A')[:100]}...")
+    
+    # Add market links
+    ticker = data.get('Selected Stock', '')
     lines.append("")
     lines.append(f"📊 *MARKET LINKS:*")
-    ticker = data.get('Selected Stock', '')
     lines.append(f"  [TradingView](https://www.tradingview.com/symbols/EGX-{ticker}/)")
     lines.append(f"  [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}.CA)")
     
@@ -252,31 +311,32 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_message = f"""
 👋 *Welcome to the EGX Stock Analyzer Bot!*
 
-Hi {user.first_name}! I read your Excel analysis from GitHub.
+Hi {user.first_name}! I read your Excel analysis and provide detailed stock recommendations.
 
 📊 *Stats:* {stock_count} stocks in your portfolio
 🕐 *Updated:* Daily at 5 PM Egypt Time
 
 *Commands:*
-/analyze TICKER - Get full analysis for a stock
+/show TICKER - Get full analysis for a stock
 /list - Show all stocks with quick buttons
 /report - Get the latest Excel report URL
 /refresh - Reload data from GitHub
 /status - Check when data was last updated
+/help - Show this help
 
 *Example:*
-/analyze COMI
+/show COMI
 
-📅 *Data As Of:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
+📅 *Last Excel Update:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
     await update.message.reply_text(welcome_message, parse_mode="Markdown")
 
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Get analysis for a specific ticker."""
+async def show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Get full analysis for a specific ticker."""
     if not context.args:
         await update.message.reply_text(
             "❌ Please provide a ticker symbol.\n"
-            "Example: /analyze COMI"
+            "Example: /show COMI"
         )
         return
     
@@ -285,21 +345,23 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     data = get_stock_data(ticker)
     if data is None:
-        await update.message.reply_text(f"❌ Ticker '{ticker}' not found.")
+        await update.message.reply_text(f"❌ Ticker '{ticker}' not found in the Excel file.")
         return
     
     response = format_stock_response(data)
     await update.message.reply_text(response, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all tickers."""
+    """Show all tickers with quick analysis buttons."""
     df = read_analysis_data()
     if df is None or df.empty:
-        await update.message.reply_text("📋 No tickers found.")
+        await update.message.reply_text("📋 No tickers found in the Excel file.")
         return
     
+    # Create formatted list with recommendations
     lines = ["📋 *PORTFOLIO SUMMARY*", "=" * 30, ""]
     
+    # Group by recommendation
     for rec in ["Buy", "Watch", "Hold", "Avoid"]:
         rec_df = df[df["Recommendation"] == rec]
         if not rec_df.empty:
@@ -309,16 +371,18 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ticker = row["Selected Stock"]
                 price = row.get("Current EGP Price")
                 price_str = format_number(price) if price else "N/A"
-                lines.append(f"  • {ticker} @ {price_str} EGP")
+                undervalued = "💎" if row.get("Undervalued (Yes/No)") == "Yes" else ""
+                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}")
             lines.append("")
     
     lines.append("_Click a button to analyze any ticker!_")
     
+    # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()
     keyboard = []
     row = []
     for ticker in tickers[:30]:
-        button = InlineKeyboardButton(ticker, callback_data=f"analyze_{ticker}")
+        button = InlineKeyboardButton(ticker, callback_data=f"show_{ticker}")
         row.append(button)
         if len(row) >= 3:
             keyboard.append(row)
@@ -328,21 +392,6 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=reply_markup)
-
-async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Refresh data from GitHub."""
-    global cached_data, cache_timestamp
-    
-    # Clear cache
-    cached_data = None
-    cache_timestamp = None
-    
-    # Force refresh
-    df = read_analysis_data()
-    if df is None:
-        await update.message.reply_text("❌ Could not refresh data.")
-    else:
-        await update.message.reply_text(f"✅ Data refreshed! {len(df)} stocks loaded.")
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the GitHub URL for the Excel report."""
@@ -363,6 +412,38 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 3. Open with Excel to view all analysis
 """
     await update.message.reply_text(message, parse_mode="Markdown")
+
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh data from Excel."""
+    global cached_data, cache_timestamp
+    
+    # Clear cache
+    cached_data = None
+    cache_timestamp = None
+    
+    df = read_analysis_data()
+    if df is None:
+        await update.message.reply_text("❌ Could not read Excel file from GitHub.")
+    else:
+        # Count recommendations
+        counts = df["Recommendation"].value_counts()
+        summary = "✅ *Data Refreshed!*\n\n"
+        summary += f"📊 *Total Stocks:* {len(df)}\n\n"
+        summary += "*Recommendations:*\n"
+        for rec in ["Buy", "Watch", "Hold", "Avoid"]:
+            count = counts.get(rec, 0)
+            emoji = {"Buy": "🟢", "Watch": "🟡", "Hold": "🔵", "Avoid": "🔴"}.get(rec, "⚪")
+            summary += f"  {emoji} {rec}: {count}\n"
+        
+        # Undervalued count
+        if "Undervalued (Yes/No)" in df.columns:
+            undervalued = df[df["Undervalued (Yes/No)"] == "Yes"].shape[0]
+            summary += f"\n💎 Undervalued: {undervalued}"
+        
+        if "Golden Cross (Yes/No)" in df.columns:
+            summary += f"\n⭐ Golden Cross: {df[df['Golden Cross (Yes/No)'] == 'Yes'].shape[0]}"
+        
+        await update.message.reply_text(summary, parse_mode="Markdown")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Check data status."""
@@ -397,8 +478,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     
-    if query.data.startswith("analyze_"):
-        ticker = query.data.replace("analyze_", "")
+    if query.data.startswith("show_"):
+        ticker = query.data.replace("show_", "")
         
         data = get_stock_data(ticker)
         if data is None:
@@ -415,24 +496,70 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Use /help to see available commands."
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show help message."""
+    help_text = """
+📚 *EGX Stock Analyzer Bot - Help*
+
+*Commands:*
+
+/show TICKER - Get full analysis for a specific stock
+  Example: /show COMI
+
+/list - Show all stocks with quick buttons
+  Displays stocks grouped by recommendation
+
+/report - Get the latest Excel report URL
+  Sends the GitHub link to download the analysis file
+
+/refresh - Refresh data from GitHub
+  Shows summary statistics
+
+/status - Check when data was last updated
+  Shows cache status and next update time
+
+/help - Show this help message
+
+*Ticker Format:*
+Use the ticker symbols as they appear in your Excel file.
+Examples: COMI, CIB, EGAL, etc.
+
+*Data Source:*
+📁 GitHub: {GITHUB_RAW_URL}
+🔄 Auto-updated daily at 5 PM Egypt Time
+💾 Cached for 5 minutes to reduce API calls
+"""
+    await update.message.reply_text(help_text.format(GITHUB_RAW_URL=GITHUB_RAW_URL), parse_mode="Markdown")
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
 async def post_init(application: Application) -> None:
     """Show bot is ready."""
     print(f"✅ Bot started: @{application.bot.username}")
     print(f"📊 GitHub URL: {GITHUB_RAW_URL}")
     df = read_analysis_data()
     if df is not None:
-        print(f"📈 Found {len(df)} stocks")
+        print(f"📈 Found {len(df)} stocks in the analysis")
+        if "Recommendation" in df.columns:
+            print(f"📊 Recommendations: {df['Recommendation'].value_counts().to_dict()}")
+        # Check for new columns
+        if "VWMA" in df.columns:
+            print("✅ VWMA column found")
+        if "TA Data As Of" in df.columns:
+            print("✅ TA Data As Of column found")
     else:
-        print("⚠️ Could not load data")
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
+        print("⚠️ Could not load data from GitHub")
 
 def main():
+    # Check token
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN environment variable not set!")
-        print("Set it with: export BOT_TOKEN=your_token_here")
+        print("\nTo set it:")
+        print("  export BOT_TOKEN=your_token_here")
+        print("\nOr create a .env file with:")
+        print("  BOT_TOKEN=your_token_here")
         sys.exit(1)
     
     # Create application
@@ -441,17 +568,18 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("analyze", analyze_command))
+    application.add_handler(CommandHandler("show", show_command))
     application.add_handler(CommandHandler("list", list_command))
-    application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
     # Start
-    print("🤖 EGX Stock Analyzer Bot is starting...")
-    print("📊 Reading from GitHub...")
+    print("🤖 EGX Stock Analyzer Bot (Full Version - GitHub Edition) is starting...")
+    print(f"📊 Reading from: {GITHUB_RAW_URL}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
