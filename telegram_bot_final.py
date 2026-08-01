@@ -40,9 +40,6 @@ BOT_TOKEN = "8835219734:AAGzyxRJ5TEasSuIOWXXrzMmpCMyl5AEGdk"  # <-- CHANGE THIS
 # GitHub raw URL for your Excel file
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/ARa2of/egx-stock-analysis/main/Stock_Analysis_Output.xlsx"
 
-# Local Excel file (fallback if GitHub fails)
-LOCAL_EXCEL_FILE = r"D:\Stocks\Stock_Screener_Raouf\Stock_Analysis_Output.xlsx"
-
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
