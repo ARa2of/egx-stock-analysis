@@ -578,7 +578,7 @@ def main():
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
     # Start
-    print("🤖 EGX Stock Analyzer Bot (Full Version - GitHub Edition) is starting...")
+    print("🤖 EGX Selected Stock Analyzer Bot (Full Version - GitHub Edition) is starting...")
     print(f"📊 Reading from: {GITHUB_RAW_URL}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
