@@ -15,6 +15,7 @@ Reads Excel file from GitHub (updated daily at 5 PM Egypt Time)
 import logging
 import sys
 import io
+import os
 import requests
 import pandas as pd
 from datetime import datetime
