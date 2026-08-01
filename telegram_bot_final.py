@@ -13,7 +13,10 @@ Run:
     python telegram_bot_full_github.py
 """
 
+import asyncio
+import json
 import logging
+import re
 import sys
 import io
 import os
@@ -31,6 +34,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -52,6 +60,137 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------
+# Gemini AI configuration
+# --------------------------------------------------------------------------
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")  # cheap/fast: gemini-3.5-flash-lite
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")  # cheap/fast: gemini-3.5-flash-lite
+
+gemini_client = None
+if genai is not None and GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini client: {e}")
+elif genai is None:
+    logger.warning("google-genai package not installed; /ask and /report will be disabled")
+else:
+    logger.warning("GEMINI_API_KEY not set; /ask and /report will be disabled")
+
+# Columns sent to Gemini for analysis (kept compact to minimize token usage)
+GEMINI_SUMMARY_COLUMNS = [
+    "Selected Stock", "Current EGP Price", "Recommendation",
+    "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
+    "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
+    "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
+    "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
+    "Take Profit 1", "Take Profit 2", "Take Profit 3",
+    "TP1 Risk/Reward", "TP2 Risk/Reward", "TP3 Risk/Reward",
+    "Recommendation Basis",
+]
+
+# --------------------------------------------------------------------------
+# AI memory - a small local JSON store so the bot can recall prior
+# snapshots/insights for a stock, and prior daily reports, without needing
+# to re-query Gemini for history (saves tokens and gives real continuity).
+# --------------------------------------------------------------------------
+
+AI_MEMORY_PATH = os.environ.get(
+    "AI_MEMORY_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_memory.json")
+)
+MAX_HISTORY_PER_TICKER = 30   # keep last N snapshots per stock
+MAX_REPORT_HISTORY = 15       # keep last N daily reports
+
+
+def _load_memory() -> dict:
+    try:
+        with open(AI_MEMORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"stocks": {}, "reports": []}
+
+
+def _save_memory(memory: dict) -> None:
+    try:
+        with open(AI_MEMORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(memory, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"Failed to save AI memory: {e}")
+
+
+def remember_stock_snapshot(ticker: str, row: dict, insight: str) -> None:
+    """Save today's key figures + a short AI insight for a ticker, so a
+    future question about the same stock has real history to draw on."""
+    memory = _load_memory()
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = {
+        "date": today,
+        "price": row.get("Current EGP Price"),
+        "recommendation": row.get("Recommendation"),
+        "rsi": row.get("RSI (%)"),
+        "golden_cross": row.get("Golden Cross (Yes/No)"),
+        "diamond_cross": row.get("Diamond Cross (20>50) (Yes/No)"),
+        "insight": (insight or "")[:500],
+    }
+    ticker = ticker.upper()
+    history = memory.setdefault("stocks", {}).setdefault(ticker, [])
+    history[:] = [h for h in history if h.get("date") != today]  # replace same-day entry
+    history.append(entry)
+    memory["stocks"][ticker] = history[-MAX_HISTORY_PER_TICKER:]
+    _save_memory(memory)
+
+
+def get_stock_history(ticker: str, limit: int = 8) -> list:
+    memory = _load_memory()
+    return memory.get("stocks", {}).get(ticker.upper(), [])[-limit:]
+
+
+def format_stock_history(history: list) -> str:
+    if not history:
+        return "No prior history recorded for this stock."
+    lines = [
+        f"{h.get('date')}: price={h.get('price')}, rec={h.get('recommendation')}, "
+        f"RSI={h.get('rsi')}, golden_cross={h.get('golden_cross')}, "
+        f"diamond_cross={h.get('diamond_cross')}, prior_insight=\"{h.get('insight', '')[:150]}\""
+        for h in history
+    ]
+    return "\n".join(lines)
+
+
+def remember_report(summary: str) -> None:
+    memory = _load_memory()
+    memory.setdefault("reports", []).append({
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "summary": (summary or "")[:800],
+    })
+    memory["reports"] = memory["reports"][-MAX_REPORT_HISTORY:]
+    _save_memory(memory)
+
+
+def get_recent_reports(limit: int = 3) -> list:
+    memory = _load_memory()
+    return memory.get("reports", [])[-limit:]
+
+
+def format_report_history(reports: list) -> str:
+    if not reports:
+        return "No prior daily reports recorded."
+    return "\n\n".join(f"{r.get('date')}:\n{r.get('summary')}" for r in reports)
+
+
+def find_mentioned_tickers(question: str, df: pd.DataFrame) -> list:
+    """Detect which tracked tickers are referenced in a free-form question,
+    so we know which stocks' history to attach and which to save a new
+    snapshot for."""
+    tickers = df["Selected Stock"].astype(str).str.upper().unique().tolist()
+    q_upper = question.upper()
+    return [t for t in tickers if re.search(rf"\b{re.escape(t)}\b", q_upper)]
 
 # Cache for data
 cached_data = None
@@ -186,6 +325,95 @@ def format_number(val, decimals=2):
         return str(val)
     except:
         return str(val)
+
+# --------------------------------------------------------------------------
+# Gemini AI helpers
+# --------------------------------------------------------------------------
+
+def build_compact_data_summary(df: pd.DataFrame, max_basis_chars: int = 100) -> str:
+    """Build a compact CSV of the key columns for all stocks, to keep the
+    Gemini prompt (and token cost) small while still giving it everything
+    it needs to reason about the portfolio."""
+    cols = [c for c in GEMINI_SUMMARY_COLUMNS if c in df.columns]
+    compact = df[cols].copy()
+    if "Recommendation Basis" in compact.columns:
+        compact["Recommendation Basis"] = (
+            compact["Recommendation Basis"].astype(str).str.slice(0, max_basis_chars)
+        )
+    return compact.to_csv(index=False)
+
+
+def build_ask_prompt(data_csv: str, question: str, history_text: str = "") -> str:
+    history_section = (
+        f"\nPRIOR HISTORY FOR STOCKS MENTIONED IN THE QUESTION:\n{history_text}\n"
+        if history_text else ""
+    )
+    return (
+        "You are a technical analysis assistant for an Egyptian Exchange (EGX) stock "
+        "portfolio. Below is the latest daily analysis data for all tracked stocks in "
+        "CSV format. Use only this data (and the prior history, if given) to answer - "
+        "do not invent prices or values not present, and say so if the data is "
+        "insufficient to answer.\n\n"
+        f"DATA:\n{data_csv}\n"
+        f"{history_section}\n"
+        f"QUESTION: {question}\n\n"
+        "Answer concisely, referencing specific tickers and figures from the data. "
+        "If prior history is given, note anything that changed since then (price "
+        "direction, recommendation, RSI, crosses). Keep the answer suitable for a "
+        "Telegram chat message (short paragraphs or bullet points, avoid large "
+        "markdown tables)."
+    )
+
+
+def build_daily_report_prompt(data_csv: str, report_history_text: str = "") -> str:
+    history_section = (
+        f"\nPRIOR RECENT REPORTS (for context - note what changed since then):\n{report_history_text}\n"
+        if report_history_text else ""
+    )
+    return (
+        "You are a technical analysis assistant reviewing today's EGX (Egyptian "
+        "Exchange) stock scan. Below is the full dataset in CSV format for all "
+        "tracked stocks.\n\n"
+        f"DATA:\n{data_csv}\n"
+        f"{history_section}\n"
+        "Task: identify the stocks with the strongest potential to increase in price "
+        "in the near term, based on the technical signals in the data "
+        "(Recommendation, Golden/Diamond Cross status, RSI level, volume/buy-volume "
+        "multipliers, proximity to support, and risk/reward on the take-profit "
+        "levels).\n\n"
+        "Produce a short daily report for Telegram with:\n"
+        "1. A ranked shortlist (top 5-8) of the most promising tickers, each with a "
+        "one-line rationale referencing specific figures from the data.\n"
+        "2. A brief note on any stocks flashing warning signs (e.g. Death Cross, RSI "
+        "overbought).\n"
+        "3. If prior reports are given, a short 'what changed' note (new entries to "
+        "the shortlist, stocks that dropped off, and why).\n\n"
+        "Keep the whole report under 350 words, use simple formatting (bold ticker "
+        "names, short bullets), and do not invent data not present in the CSV."
+    )
+
+
+def call_gemini(prompt: str) -> str:
+    """Blocking call to the Gemini API - run this via asyncio.to_thread from
+    async handlers so it doesn't block the bot's event loop."""
+    if gemini_client is None:
+        raise RuntimeError(
+            "Gemini isn't configured (missing GEMINI_API_KEY or google-genai package)."
+        )
+    response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    return response.text
+
+
+async def send_long_message(send_func, text: str, chunk_size: int = 3500) -> None:
+    """Send a long message in Telegram-safe chunks (4096 char hard limit).
+    Falls back to plain text per chunk if Markdown parsing fails, since
+    AI-generated text can produce unbalanced markdown."""
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i + chunk_size]
+        try:
+            await send_func(chunk, parse_mode="Markdown")
+        except Exception:
+            await send_func(chunk)
 
 def format_stock_response(data: Dict[str, Any]) -> str:
     """Format ALL stock data for Telegram display."""
@@ -325,6 +553,8 @@ Hi {user.first_name}! I read your Excel analysis and provide detailed stock reco
 /report - Get the latest Excel report URL
 /refresh - Reload data from GitHub
 /status - Check when data was last updated
+/ask <question> - Ask AI about any stock(s), e.g. "/ask how does COMI look?"
+/aireport - Get an AI-generated shortlist of the strongest stocks right now
 /help - Show this help
 
 *Example:*
@@ -496,6 +726,107 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         response = format_stock_response(data)
         await query.edit_message_text(response, parse_mode="Markdown", disable_web_page_preview=True)
 
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask Gemini a free-form question about the current stock data.
+    Any tracked ticker mentioned in the question gets its prior history
+    attached for context, and a new snapshot saved after answering."""
+    if gemini_client is None:
+        await update.message.reply_text(
+            "❌ AI analysis isn't configured yet.\n"
+            "Set the GEMINI_API_KEY environment variable (and pip install google-genai) to enable /ask."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Please include a question.\n"
+            "Example: /ask which stocks look strongest right now?\n"
+            "Example: /ask how does COMI compare to last week?"
+        )
+        return
+
+    question = " ".join(context.args)
+    df = read_analysis_data()
+    if df is None or df.empty:
+        await update.message.reply_text("❌ Could not read the latest analysis data.")
+        return
+
+    await update.message.reply_text("🤖 Thinking...")
+
+    mentioned_tickers = find_mentioned_tickers(question, df)
+    history_text = ""
+    if mentioned_tickers:
+        parts = [
+            f"{t}:\n{format_stock_history(get_stock_history(t))}"
+            for t in mentioned_tickers
+        ]
+        history_text = "\n\n".join(parts)
+
+    data_csv = build_compact_data_summary(df)
+    prompt = build_ask_prompt(data_csv, question, history_text)
+
+    try:
+        answer = await asyncio.to_thread(call_gemini, prompt)
+    except Exception as e:
+        logger.error(f"Gemini /ask error: {e}")
+        await update.message.reply_text(f"❌ AI request failed: {e}")
+        return
+
+    await send_long_message(update.message.reply_text, answer)
+
+    # Save a fresh snapshot for any ticker discussed, so a future question
+    # about it has real history (price/rec/RSI + a slice of this answer).
+    for t in mentioned_tickers:
+        match = df[df["Selected Stock"].astype(str).str.upper() == t]
+        if not match.empty:
+            remember_stock_snapshot(t, match.iloc[0].to_dict(), answer)
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the current chat ID (useful for debugging/config)."""
+    await update.message.reply_text(
+        f"Your chat ID is: `{update.effective_chat.id}`",
+        parse_mode="Markdown"
+    )
+
+async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """On-demand AI report: analyze the full portfolio with Gemini and reply
+    with the stocks showing the strongest upside potential. Only runs when
+    called - no automatic schedule, to keep token usage to a minimum."""
+    global cached_data, cache_timestamp
+
+    if gemini_client is None:
+        await update.message.reply_text(
+            "❌ AI analysis isn't configured yet.\n"
+            "Set the GEMINI_API_KEY environment variable (and pip install google-genai) to enable /aireport."
+        )
+        return
+
+    await update.message.reply_text("🤖 Analyzing today's data, one moment...")
+
+    # Force a fresh read so the report reflects the latest data, not a stale cache
+    cached_data = None
+    cache_timestamp = None
+    df = read_analysis_data()
+    if df is None or df.empty:
+        await update.message.reply_text("❌ Could not read the latest analysis data from GitHub.")
+        return
+
+    data_csv = build_compact_data_summary(df)
+    report_history_text = format_report_history(get_recent_reports())
+    prompt = build_daily_report_prompt(data_csv, report_history_text)
+
+    try:
+        report = await asyncio.to_thread(call_gemini, prompt)
+    except Exception as e:
+        logger.error(f"AI report failed: {e}")
+        await update.message.reply_text(f"❌ AI report failed: {e}")
+        return
+
+    header = f"📊 *AI Stock Report* - {datetime.now().strftime('%Y-%m-%d')}\n{'=' * 30}\n\n"
+    await send_long_message(update.message.reply_text, header + report)
+
+    remember_report(report)
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unknown commands."""
     await update.message.reply_text(
@@ -524,6 +855,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 /status - Check when data was last updated
   Shows cache status and next update time
+
+/ask <question> - Ask AI about any stock(s) or the portfolio
+  Example: /ask which stocks look strongest right now?
+  Example: /ask how does COMI compare to last week?
+  Mentioning a ticker attaches its saved history and remembers this answer for next time.
+
+/aireport - On-demand AI shortlist of the strongest stocks
+  Analyzes all tracked stocks and highlights the ones with the best
+  near-term upside, noting what changed since the last report.
+  Only runs when you call it, to keep AI usage to a minimum.
 
 /help - Show this help message
 
@@ -572,6 +913,11 @@ def main():
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     application.post_init = post_init
+
+    if gemini_client is not None:
+        print(f"✅ AI features enabled (/ask, /report) using model {GEMINI_MODEL}")
+    else:
+        print("⚠️ AI features disabled - set GEMINI_API_KEY (and pip install google-genai) to enable /ask and /report")
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -580,6 +926,9 @@ def main():
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("ask", ask_command))
+    application.add_handler(CommandHandler("aireport", ai_report_command))
+    application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
