@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import logging
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ SR_LOOKBACK_DAYS = 180
 
 SMA_SHORT_WINDOW = 50
 SMA_LONG_WINDOW = 200
+EMA_XSHORT_WINDOW = 20
 EMA_SHORT_WINDOW = 50
 EMA_LONG_WINDOW = 200
 RSI_PERIOD = 14
@@ -93,9 +95,15 @@ SL_INDICATORS = [               # Priority order for stop loss levels
 ]
 
 # TA fetch retry settings
-TA_RETRIES = 1
-TA_RETRY_DELAY = 1             # seconds (doubles each retry)
-TA_REQUEST_DELAY = 1           # seconds between different tickers
+TA_RETRIES = 5                  # attempts per ticker before giving up
+TA_RETRY_DELAY = 2              # base seconds, doubles each retry (2,4,8,16,32)
+TA_REQUEST_DELAY_MIN = 3        # min seconds between different tickers
+TA_REQUEST_DELAY_MAX = 6        # max seconds between different tickers (randomized)
+
+# Batch pause settings (pause longer every N tickers to respect rate limits)
+TA_BATCH_SIZE = 12              # pause after this many tickers (10-15 range)
+TA_BATCH_PAUSE_MIN = 45         # min seconds to pause between batches
+TA_BATCH_PAUSE_MAX = 60         # max seconds to pause between batches
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("egx_analysis")
@@ -226,16 +234,20 @@ def fetch_ta(raw_ticker: str) -> TickerTA:
 
 
 def fetch_ta_with_retry(raw_ticker: str) -> TickerTA:
-    """Attempt to fetch TA with exponential backoff on 429 errors."""
+    """Attempt to fetch TA with exponential backoff + jitter on 429 errors."""
+    entry = None
     for attempt in range(TA_RETRIES):
         entry = fetch_ta(raw_ticker)
         if entry.ok:
             return entry
-        # If it's a 429 (rate limit), wait and retry
+        # If it's a 429 (rate limit), wait (exponential backoff) and retry
         if "429" in entry.reason:
-            wait = TA_RETRY_DELAY * (2 ** attempt)
+            if attempt == TA_RETRIES - 1:
+                # last attempt already used, no point sleeping further
+                break
+            wait = TA_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 1.5)
             log.warning("%s: 429 rate limit, retrying in %.1fs (attempt %d/%d)",
-                        raw_ticker, wait, attempt+1, TA_RETRIES)
+                        raw_ticker, wait, attempt + 1, TA_RETRIES)
             time.sleep(wait)
         else:
             # Non‑429 error, don't retry
@@ -244,7 +256,12 @@ def fetch_ta_with_retry(raw_ticker: str) -> TickerTA:
 
 
 def fetch_all_ta(tickers: list, cache: Dict[str, TickerTA]) -> None:
-    for raw in tickers:
+    """
+    Fetch TA data for all tickers with:
+      - randomized delay between each ticker (avoids fixed-interval pattern)
+      - a longer pause every TA_BATCH_SIZE tickers to let any rate-limit window reset
+    """
+    for i, raw in enumerate(tickers):
         if raw in cache:
             continue
         entry = fetch_ta_with_retry(raw)
@@ -253,8 +270,20 @@ def fetch_all_ta(tickers: list, cache: Dict[str, TickerTA]) -> None:
             log.info("%s: TA data loaded", raw)
         else:
             log.warning("%s: TA fetch failed - %s", raw, entry.reason)
-        # Delay between requests to avoid flooding the API
-        time.sleep(TA_REQUEST_DELAY)
+
+        is_last = (i == len(tickers) - 1)
+        if is_last:
+            continue
+
+        # Every TA_BATCH_SIZE tickers, take a longer pause to reset any rate-limit window
+        if (i + 1) % TA_BATCH_SIZE == 0:
+            batch_pause = random.uniform(TA_BATCH_PAUSE_MIN, TA_BATCH_PAUSE_MAX)
+            log.info("Processed %d tickers, pausing %.1fs before next batch...",
+                      i + 1, batch_pause)
+            time.sleep(batch_pause)
+        else:
+            # Normal randomized delay between individual tickers
+            time.sleep(random.uniform(TA_REQUEST_DELAY_MIN, TA_REQUEST_DELAY_MAX))
 
 
 # --------------------------------------------------------------------------
@@ -761,7 +790,10 @@ def calculate_risk_reward(
 
 def compute_sma_ema_rsi_from_yf(history: pd.DataFrame) -> dict:
     close = history["Close"].dropna()
-    result = {"sma50": None, "sma200": None, "ema50": None, "ema200": None, "rsi": None}
+    result = {"sma50": None, "sma200": None, "ema20": None, "ema50": None, "ema200": None, "rsi": None}
+
+    if len(close) >= EMA_XSHORT_WINDOW:
+        result["ema20"] = float(close.ewm(span=EMA_XSHORT_WINDOW, adjust=False).mean().iloc[-1])
 
     if len(close) >= SMA_SHORT_WINDOW:
         result["sma50"] = float(close.rolling(SMA_SHORT_WINDOW).mean().iloc[-1])
@@ -802,6 +834,7 @@ def build_enhanced_recommendation_and_entry(
     golden_cross: Optional[str], 
     death_cross: Optional[str],
     rsi: Optional[float],
+    diamond_cross: Optional[str] = None,
 ) -> dict:
     """
     Enhanced recommendation with better entry price using TradingView indicators.
@@ -915,12 +948,19 @@ def build_enhanced_recommendation_and_entry(
     elif regime == "bullish":
         overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
         reasons.append("Golden Cross confirmed")
+        has_diamond = diamond_cross == "Yes"
+        if has_diamond:
+            reasons.append("Diamond Cross (EMA20>EMA50) - short-term momentum bullish")
         if overbought:
             recommendation = "Watch"
             reasons.append(f"RSI overbought ({rsi:.1f})")
         elif signal_count == 3:
             recommendation = "Buy"
         elif signal_count == 2:
+            # Diamond Cross adds extra momentum confluence -> upgrade to Buy
+            recommendation = "Buy" if has_diamond else "Watch"
+        elif signal_count <= 1 and has_diamond:
+            # Fresh momentum shift even without other signals is worth a closer look
             recommendation = "Watch"
         else:
             recommendation = "Hold"
@@ -992,6 +1032,7 @@ def run(input_path: str, output_path: str) -> None:
             ind = ta_entry.indicators
             sma50 = ind.get("SMA50")
             sma200 = ind.get("SMA200")
+            ema20 = ind.get("EMA20")
             ema50 = ind.get("EMA50")
             ema200 = ind.get("EMA200")
             rsi = ind.get("RSI")
@@ -1004,6 +1045,7 @@ def run(input_path: str, output_path: str) -> None:
             fallback = compute_sma_ema_rsi_from_yf(yf_entry.history)
             sma50 = fallback["sma50"]
             sma200 = fallback["sma200"]
+            ema20 = fallback["ema20"]
             ema50 = fallback["ema50"]
             ema200 = fallback["ema200"]
             rsi = fallback["rsi"]
@@ -1040,12 +1082,18 @@ def run(input_path: str, output_path: str) -> None:
         if ema50 is not None and ema200 is not None:
             ema_bullish = "Yes" if ema50 > ema200 else "No"
 
+        # Diamond Cross: EMA20 crossing above EMA50 (shorter-term momentum signal)
+        diamond_cross = None
+        if ema20 is not None and ema50 is not None:
+            diamond_cross = "Yes" if ema20 > ema50 else "No"
+
         # Enhanced Recommendation & Entry
         rec = build_enhanced_recommendation_and_entry(
             val, mf, sr, ind, current_price,
             sma50, sma200,
             golden_cross, death_cross,
             rsi,
+            diamond_cross,
         )
 
         rows.append({
@@ -1068,9 +1116,11 @@ def run(input_path: str, output_path: str) -> None:
             "200 SMA": round(sma200, 4) if sma200 is not None else None,
             "Golden Cross (Yes/No)": golden_cross,
             "Death Cross (Yes/No)": death_cross,
+            "20 EMA": round(ema20, 4) if ema20 is not None else None,
             "50 EMA": round(ema50, 4) if ema50 is not None else None,
             "200 EMA": round(ema200, 4) if ema200 is not None else None,
             "EMA Bullish (50>200) (Yes/No)": ema_bullish,
+            "Diamond Cross (20>50) (Yes/No)": diamond_cross,
             "RSI (%)": round(rsi, 2) if rsi is not None else None,
             "VWMA": round(vwma, 4) if vwma is not None else None,  # New column for VWMA
             "TA Data As Of": ta_fetch_time,  # New column for TA fetch time

@@ -79,9 +79,11 @@ COLUMN_DISPLAY = {
     "200 SMA": "📈 200 SMA",
     "Golden Cross (Yes/No)": "⭐ Golden Cross",
     "Death Cross (Yes/No)": "💀 Death Cross",
+    "20 EMA": "📈 20 EMA",
     "50 EMA": "📈 50 EMA",
     "200 EMA": "📈 200 EMA",
     "EMA Bullish (50>200) (Yes/No)": "📈 EMA Bullish",
+    "Diamond Cross (20>50) (Yes/No)": "💠 Diamond Cross",
     "RSI (%)": "📊 RSI",
     "VWMA": "📊 VWMA",  # New column
     "TA Data As Of": "🕐 TA Data",  # New column
@@ -211,6 +213,9 @@ def format_stock_response(data: Dict[str, Any]) -> str:
     
     ema_bullish = data.get("EMA Bullish (50>200) (Yes/No)", "No")
     ema_emoji = "✅" if ema_bullish == "Yes" else "❌"
+
+    diamond_cross = data.get("Diamond Cross (20>50) (Yes/No)", "No")
+    diamond_emoji = "💠" if diamond_cross == "Yes" else "❌"
     
     # SMA50 > SMA200 check
     sma50 = data.get("50 SMA")
@@ -239,9 +244,11 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • SMA50 > SMA200: {sma_bullish}",
         f"  • {golden_emoji} Golden Cross: {golden}",
         f"  • {death_emoji} Death Cross: {death}",
+        f"  • 20 EMA: {format_number(data.get('20 EMA'))}",
         f"  • 50 EMA: {format_number(data.get('50 EMA'))}",
         f"  • 200 EMA: {format_number(data.get('200 EMA'))}",
         f"  • {ema_emoji} EMA Bullish (50>200): {ema_bullish}",
+        f"  • {diamond_emoji} Diamond Cross (20>50): {diamond_cross}",
         f"  • RSI: {format_number(data.get('RSI (%)'))}",
         f"  • VWMA: {format_number(data.get('VWMA'))}",  # New VWMA line
         "",
@@ -368,7 +375,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 price = row.get("Current EGP Price")
                 price_str = format_number(price) if price else "N/A"
                 undervalued = "💎" if row.get("Undervalued (Yes/No)") == "Yes" else ""
-                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}")
+                diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
+                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}{diamond}")
             lines.append("")
     
     lines.append("_Click a button to analyze any ticker!_")
@@ -438,6 +446,9 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         if "Golden Cross (Yes/No)" in df.columns:
             summary += f"\n⭐ Golden Cross: {df[df['Golden Cross (Yes/No)'] == 'Yes'].shape[0]}"
+
+        if "Diamond Cross (20>50) (Yes/No)" in df.columns:
+            summary += f"\n💠 Diamond Cross: {df[df['Diamond Cross (20>50) (Yes/No)'] == 'Yes'].shape[0]}"
         
         await update.message.reply_text(summary, parse_mode="Markdown")
 
