@@ -37,8 +37,10 @@ from telegram.ext import (
 
 try:
     from google import genai
+    from google.genai import types as genai_types
 except ImportError:
     genai = None
+    genai_types = None
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -349,58 +351,84 @@ def build_ask_prompt(data_csv: str, question: str, history_text: str = "") -> st
         if history_text else ""
     )
     return (
-        "You are a technical analysis assistant for an Egyptian Exchange (EGX) stock "
-        "portfolio. Below is the latest daily analysis data for all tracked stocks in "
-        "CSV format. Use only this data (and the prior history, if given) to answer - "
-        "do not invent prices or values not present, and say so if the data is "
-        "insufficient to answer.\n\n"
+        "You are an analytical assistant for an Egyptian Exchange (EGX) stock "
+        "portfolio. Below is the latest daily technical analysis data for all "
+        "tracked stocks in CSV format.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}\n"
         f"QUESTION: {question}\n\n"
-        "Answer concisely, referencing specific tickers and figures from the data. "
-        "If prior history is given, note anything that changed since then (price "
-        "direction, recommendation, RSI, crosses). Keep the answer suitable for a "
-        "Telegram chat message (short paragraphs or bullet points, avoid large "
-        "markdown tables)."
+        "Use the DATA as the source of truth for prices, recommendations, and "
+        "technical indicators - don't contradict or invent figures that differ "
+        "from it. Beyond that, be genuinely analytical: draw on your general "
+        "knowledge of markets, sector context, and macroeconomic reasoning to "
+        "give a well-rounded view, not just a restatement of the numbers. "
+        "Clearly flag which parts of your answer are backed by the data versus "
+        "general reasoning or opinion. Keep the answer suitable for a Telegram "
+        "chat message (short paragraphs or bullet points, avoid large markdown "
+        "tables)."
     )
 
 
-def build_daily_report_prompt(data_csv: str, report_history_text: str = "") -> str:
+def build_daily_report_prompt(data_csv: str, report_history_text: str = "", searched: bool = False) -> str:
     history_section = (
         f"\nPRIOR RECENT REPORTS (for context - note what changed since then):\n{report_history_text}\n"
         if report_history_text else ""
     )
+    search_line = (
+        "Use search to check for recent news, sector trends, or macro/EGP "
+        "currency context that could reinforce or undercut the technical "
+        "picture for your top picks, and weigh that in your ranking.\n\n"
+        if searched else ""
+    )
     return (
-        "You are a technical analysis assistant reviewing today's EGX (Egyptian "
-        "Exchange) stock scan. Below is the full dataset in CSV format for all "
-        "tracked stocks.\n\n"
+        "You are an analytical assistant reviewing today's EGX (Egyptian Exchange) "
+        "stock scan. Below is the full dataset in CSV format for all tracked "
+        "stocks.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}\n"
-        "Task: identify the stocks with the strongest potential to increase in price "
-        "in the near term, based on the technical signals in the data "
-        "(Recommendation, Golden/Diamond Cross status, RSI level, volume/buy-volume "
-        "multipliers, proximity to support, and risk/reward on the take-profit "
-        "levels).\n\n"
-        "Produce a short daily report for Telegram with:\n"
-        "1. A ranked shortlist (top 5-8) of the most promising tickers, each with a "
-        "one-line rationale referencing specific figures from the data.\n"
-        "2. A brief note on any stocks flashing warning signs (e.g. Death Cross, RSI "
-        "overbought).\n"
-        "3. If prior reports are given, a short 'what changed' note (new entries to "
-        "the shortlist, stocks that dropped off, and why).\n\n"
-        "Keep the whole report under 350 words, use simple formatting (bold ticker "
-        "names, short bullets), and do not invent data not present in the CSV."
+        "Task: identify the stocks with the strongest potential to increase in "
+        "price in the near term. Use the technical signals in the DATA "
+        "(Recommendation, Golden/Diamond Cross status, RSI level, volume/buy-"
+        "volume multipliers, proximity to support, risk/reward on take-profit "
+        "levels) as your primary evidence, and bring in your general market "
+        "knowledge and reasoning (sector context, typical EGX behavior, "
+        "macro conditions) to give a genuinely analytical view rather than a "
+        f"plain restatement of the numbers.\n\n{search_line}"
+        "Produce a short report for Telegram with:\n"
+        "1. A ranked shortlist (top 5-8) of the most promising tickers, each with "
+        "a rationale that combines the technical data with your broader "
+        "reasoning.\n"
+        "2. A brief note on any stocks flashing warning signs (e.g. Death Cross, "
+        "RSI overbought).\n"
+        "3. If prior reports are given, a short 'what changed' note (new entries "
+        "to the shortlist, stocks that dropped off, and why).\n\n"
+        "Keep the whole report under 400 words, use simple formatting (bold "
+        "ticker names, short bullets), and clearly distinguish data-backed points "
+        "from broader analysis or opinion."
     )
 
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, use_search: bool = False) -> str:
     """Blocking call to the Gemini API - run this via asyncio.to_thread from
-    async handlers so it doesn't block the bot's event loop."""
+    async handlers so it doesn't block the bot's event loop.
+
+    use_search=True enables Grounding with Google Search (billed per search
+    query the model actually executes, on top of normal token cost) so it can
+    pull in real current information. Off by default to keep cost minimal -
+    most questions are well served by the Excel data + the model's general
+    knowledge alone."""
     if gemini_client is None:
         raise RuntimeError(
             "Gemini isn't configured (missing GEMINI_API_KEY or google-genai package)."
         )
-    response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    config = None
+    if use_search and genai_types is not None:
+        config = genai_types.GenerateContentConfig(
+            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+        )
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL, contents=prompt, config=config
+    )
     return response.text
 
 
@@ -741,11 +769,20 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             "❌ Please include a question.\n"
             "Example: /ask which stocks look strongest right now?\n"
-            "Example: /ask how does COMI compare to last week?"
+            "Example: /ask how does COMI compare to last week?\n"
+            "Add 'web:' to let it check live news (small extra cost): /ask web: any recent news on COMI?"
         )
         return
 
     question = " ".join(context.args)
+
+    # Search is off by default to minimize cost - opt in per-question by
+    # starting with "web:" (e.g. "/ask web: any recent news on COMI?")
+    use_search = False
+    if question.lower().startswith("web:"):
+        use_search = True
+        question = question[4:].strip()
+
     df = read_analysis_data()
     if df is None or df.empty:
         await update.message.reply_text("❌ Could not read the latest analysis data.")
@@ -766,7 +803,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     prompt = build_ask_prompt(data_csv, question, history_text)
 
     try:
-        answer = await asyncio.to_thread(call_gemini, prompt)
+        answer = await asyncio.to_thread(call_gemini, prompt, use_search)
     except Exception as e:
         logger.error(f"Gemini /ask error: {e}")
         await update.message.reply_text(f"❌ AI request failed: {e}")
@@ -803,6 +840,9 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await update.message.reply_text("🤖 Analyzing today's data, one moment...")
 
+    # Search is off by default to minimize cost - opt in with: /aireport web
+    use_search = bool(context.args) and context.args[0].lower() == "web"
+
     # Force a fresh read so the report reflects the latest data, not a stale cache
     cached_data = None
     cache_timestamp = None
@@ -813,10 +853,10 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     data_csv = build_compact_data_summary(df)
     report_history_text = format_report_history(get_recent_reports())
-    prompt = build_daily_report_prompt(data_csv, report_history_text)
+    prompt = build_daily_report_prompt(data_csv, report_history_text, searched=use_search)
 
     try:
-        report = await asyncio.to_thread(call_gemini, prompt)
+        report = await asyncio.to_thread(call_gemini, prompt, use_search)
     except Exception as e:
         logger.error(f"AI report failed: {e}")
         await update.message.reply_text(f"❌ AI report failed: {e}")
@@ -860,11 +900,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
   Example: /ask which stocks look strongest right now?
   Example: /ask how does COMI compare to last week?
   Mentioning a ticker attaches its saved history and remembers this answer for next time.
+  Add 'web:' at the start to let it check live news too (small extra cost): /ask web: any recent news on COMI?
 
 /aireport - On-demand AI shortlist of the strongest stocks
   Analyzes all tracked stocks and highlights the ones with the best
   near-term upside, noting what changed since the last report.
   Only runs when you call it, to keep AI usage to a minimum.
+  Add "web" to also check live news/context (small extra cost): /aireport web
 
 /help - Show this help message
 
