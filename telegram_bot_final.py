@@ -37,6 +37,13 @@ from telegram.ext import (
 # GitHub raw URL for your Excel file
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/ARa2of/egx-stock-analysis/main/Stock_Analysis_Output.xlsx"
 
+# Get token from environment variable
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("❌ ERROR: BOT_TOKEN environment variable not set!")
+    print("Set it with: export BOT_TOKEN=your_token_here")
+    sys.exit(1)
+    
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -422,12 +429,9 @@ async def post_init(application: Application) -> None:
 # --------------------------------------------------------------------------
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: Please set your BOT_TOKEN!")
-        print("\nTo get a bot token:")
-        print("  1. Open Telegram and search for @BotFather")
-        print("  2. Send /newbot and follow the instructions")
-        print("  3. Copy the token and paste it into the code")
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN environment variable not set!")
+        print("Set it with: export BOT_TOKEN=your_token_here")
         sys.exit(1)
     
     # Create application
