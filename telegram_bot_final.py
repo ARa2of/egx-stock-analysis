@@ -291,11 +291,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
     
     # Add market links
     ticker = data.get('Selected Stock', '')
-    lines.append("")
-    lines.append(f"📊 *MARKET LINKS:*")
-    lines.append(f"  [TradingView](https://www.tradingview.com/symbols/EGX-{ticker}/)")
-    lines.append(f"  [Yahoo Finance](https://finance.yahoo.com/quote/{ticker}.CA)")
-    
+    lines.append("")   
     return "\n".join(lines)
 
 # --------------------------------------------------------------------------
