@@ -30,8 +30,9 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
-from tradingview_ta import TA_Handler, Interval
+from tradingview_ta import Interval, TradingView
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -94,16 +95,24 @@ SL_INDICATORS = [               # Priority order for stop loss levels
     "SMA200"
 ]
 
-# TA fetch retry settings
-TA_RETRIES = 5                  # attempts per ticker before giving up
-TA_RETRY_DELAY = 2              # base seconds, doubles each retry (2,4,8,16,32)
-TA_REQUEST_DELAY_MIN = 3        # min seconds between different tickers
-TA_REQUEST_DELAY_MAX = 6        # max seconds between different tickers (randomized)
+# TA fetch settings - BATCHED requests (one HTTP call can carry many symbols,
+# since TradingView's scanner endpoint natively supports multi-symbol queries).
+# This is the real fix for 429s: it cuts ~200 individual requests down to a
+# handful of chunked ones, rather than just spacing out the same volume of calls.
+TA_EXCHANGE = "EGX"
+TA_SCREENER = "egypt"
+TA_SYMBOLS_PER_REQUEST = 40      # symbols per single scanner request (chunked for safety)
+TA_BATCH_RETRIES = 4             # retries per chunk on failure/429
+TA_BATCH_RETRY_DELAY = 5         # base seconds, doubles each retry (5,10,20,40)
+TA_INTER_CHUNK_DELAY_MIN = 5     # seconds to pause between chunks
+TA_INTER_CHUNK_DELAY_MAX = 10
 
-# Batch pause settings (pause longer every N tickers to respect rate limits)
-TA_BATCH_SIZE = 12              # pause after this many tickers (10-15 range)
-TA_BATCH_PAUSE_MIN = 45         # min seconds to pause between batches
-TA_BATCH_PAUSE_MAX = 60         # max seconds to pause between batches
+# A normal browser User-Agent instead of the library's default
+# "tradingview_ta/X.X.X" string, which is an easy bot signature.
+TA_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("egx_analysis")
@@ -207,83 +216,114 @@ def download_all(tickers: list, cache: Dict[str, TickerData]) -> None:
 # Step 3: TradingView TA (with retry and delay)
 # --------------------------------------------------------------------------
 
-def fetch_ta(raw_ticker: str) -> TickerTA:
-    """Single attempt to fetch TA data."""
-    entry = TickerTA(raw_ticker=raw_ticker)
-    try:
-        handler = TA_Handler(
-            symbol=raw_ticker,
-            exchange="EGX",
-            screener="egypt",
-            interval=Interval.INTERVAL_1_DAY
-        )
-        analysis = handler.get_analysis()
-        indicators = analysis.indicators
-
-        if indicators.get("close") is None:
-            entry.reason = "no close price"
-            return entry
-
-        entry.indicators = indicators
-        entry.ok = True
-        entry.fetch_time = datetime.now()  # Record fetch time
-        return entry
-    except Exception as e:
-        entry.reason = f"TA fetch error: {e}"
-        return entry
+def chunk_list(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
-def fetch_ta_with_retry(raw_ticker: str) -> TickerTA:
-    """Attempt to fetch TA with exponential backoff + jitter on 429 errors."""
-    entry = None
-    for attempt in range(TA_RETRIES):
-        entry = fetch_ta(raw_ticker)
-        if entry.ok:
-            return entry
-        # If it's a 429 (rate limit), wait (exponential backoff) and retry
-        if "429" in entry.reason:
-            if attempt == TA_RETRIES - 1:
-                # last attempt already used, no point sleeping further
+def fetch_ta_chunk_raw(symbols: List[str]) -> Dict[str, Optional[dict]]:
+    """
+    Manually POST to TradingView's scanner endpoint for multiple symbols in a
+    single request. Done manually (rather than via tradingview_ta's own
+    get_multiple_analysis helper) for two reasons:
+      1. That helper doesn't check the HTTP status code before parsing the
+         response as JSON, so a 429 there raises a confusing JSONDecodeError
+         instead of a clean, retryable error.
+      2. It lets us send a normal browser User-Agent instead of the library's
+         default "tradingview_ta/X.X.X" header, an easy bot signature.
+
+    Returns {raw_ticker: indicators_dict_or_None}.
+    """
+    scan_url = f"{TradingView.scan_url}{TA_SCREENER.lower()}/scan"
+    tv_symbols = [f"{TA_EXCHANGE}:{s}" for s in symbols]
+    indicator_columns = TradingView.indicators
+    payload = {
+        "symbols": {"tickers": [s.upper() for s in tv_symbols], "query": {"types": []}},
+        "columns": indicator_columns,
+    }
+    headers = {"User-Agent": TA_USER_AGENT}
+    response = requests.post(scan_url, json=payload, headers=headers, timeout=30)
+
+    if response.status_code == 429:
+        raise RuntimeError("429 rate limit")
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+
+    data = response.json().get("data", [])
+    by_symbol = {item["s"].upper(): item["d"] for item in data}
+
+    result: Dict[str, Optional[dict]] = {}
+    for raw, tv_symbol in zip(symbols, tv_symbols):
+        row = by_symbol.get(tv_symbol.upper())
+        result[raw] = dict(zip(indicator_columns, row)) if row is not None else None
+    return result
+
+
+def fetch_ta_batch(tickers: List[str]) -> Dict[str, "TickerTA"]:
+    """
+    Fetch TA data for a list of raw tickers using TradingView's multi-symbol
+    scanner endpoint. Sends TA_SYMBOLS_PER_REQUEST symbols per HTTP call,
+    so e.g. 200 tickers becomes ~5 requests instead of ~200 - avoiding the
+    per-request rate limiting entirely rather than just slowing it down.
+    """
+    cache: Dict[str, TickerTA] = {}
+    chunks = list(chunk_list(tickers, TA_SYMBOLS_PER_REQUEST))
+    total_chunks = len(chunks)
+
+    for idx, chunk in enumerate(chunks):
+        chunk_result: Optional[Dict[str, Optional[dict]]] = None
+        fetch_time = None
+
+        for attempt in range(TA_BATCH_RETRIES):
+            try:
+                chunk_result = fetch_ta_chunk_raw(chunk)
+                fetch_time = datetime.now()
                 break
-            wait = TA_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 1.5)
-            log.warning("%s: 429 rate limit, retrying in %.1fs (attempt %d/%d)",
-                        raw_ticker, wait, attempt + 1, TA_RETRIES)
-            time.sleep(wait)
-        else:
-            # Non‑429 error, don't retry
-            break
-    return entry
+            except Exception as e:
+                reason = str(e)
+                is_last_attempt = attempt == TA_BATCH_RETRIES - 1
+                if "429" in reason and not is_last_attempt:
+                    wait = TA_BATCH_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 2)
+                    log.warning(
+                        "TA batch %d/%d: 429 rate limit, retrying in %.1fs (attempt %d/%d)",
+                        idx + 1, total_chunks, wait, attempt + 1, TA_BATCH_RETRIES
+                    )
+                    time.sleep(wait)
+                    continue
+                log.warning("TA batch %d/%d failed: %s", idx + 1, total_chunks, reason)
+                chunk_result = None
+                break
+
+        for raw in chunk:
+            entry = TickerTA(raw_ticker=raw)
+            indicators = chunk_result.get(raw) if chunk_result else None
+            if indicators and indicators.get("close") is not None:
+                entry.indicators = indicators
+                entry.ok = True
+                entry.fetch_time = fetch_time
+                log.info("%s: TA data loaded (batch %d/%d)", raw, idx + 1, total_chunks)
+            else:
+                entry.reason = "no TA data in batch response"
+                log.warning("%s: TA fetch failed - %s", raw, entry.reason)
+            cache[raw] = entry
+
+        if idx < total_chunks - 1:
+            pause = random.uniform(TA_INTER_CHUNK_DELAY_MIN, TA_INTER_CHUNK_DELAY_MAX)
+            log.info(
+                "Processed chunk %d/%d (%d symbols), pausing %.1fs before next chunk...",
+                idx + 1, total_chunks, len(chunk), pause
+            )
+            time.sleep(pause)
+
+    return cache
 
 
 def fetch_all_ta(tickers: list, cache: Dict[str, TickerTA]) -> None:
-    """
-    Fetch TA data for all tickers with:
-      - randomized delay between each ticker (avoids fixed-interval pattern)
-      - a longer pause every TA_BATCH_SIZE tickers to let any rate-limit window reset
-    """
-    for i, raw in enumerate(tickers):
-        if raw in cache:
-            continue
-        entry = fetch_ta_with_retry(raw)
-        cache[raw] = entry
-        if entry.ok:
-            log.info("%s: TA data loaded", raw)
-        else:
-            log.warning("%s: TA fetch failed - %s", raw, entry.reason)
-
-        is_last = (i == len(tickers) - 1)
-        if is_last:
-            continue
-
-        # Every TA_BATCH_SIZE tickers, take a longer pause to reset any rate-limit window
-        if (i + 1) % TA_BATCH_SIZE == 0:
-            batch_pause = random.uniform(TA_BATCH_PAUSE_MIN, TA_BATCH_PAUSE_MAX)
-            log.info("Processed %d tickers, pausing %.1fs before next batch...",
-                      i + 1, batch_pause)
-            time.sleep(batch_pause)
-        else:
-            # Normal randomized delay between individual tickers
-            time.sleep(random.uniform(TA_REQUEST_DELAY_MIN, TA_REQUEST_DELAY_MAX))
+    """Populate cache with TA data for all tickers via batched requests."""
+    to_fetch = [t for t in tickers if t not in cache]
+    if not to_fetch:
+        return
+    cache.update(fetch_ta_batch(to_fetch))
 
 
 # --------------------------------------------------------------------------
