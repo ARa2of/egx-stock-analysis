@@ -1,44 +1,36 @@
 # .github/workflows/update_stock_data.yml
 name: Update Stock Analysis - Daily at 5 PM Egypt Time
-
 # ✅ Add these permissions at the top level
 permissions:
   contents: write
   pull-requests: read
-
 on:
   schedule:
     - cron: '0 15 * * *'  # 5 PM Egypt Time (3 PM UTC)
   workflow_dispatch:
-
 jobs:
   update-analysis:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         # ✅ This is important - it ensures we can push back
         persist-credentials: true
-
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-
     - name: Install dependencies
       run: |
-        pip install pandas numpy yfinance openpyxl tradingview-ta
-
+        pip install pandas numpy yfinance openpyxl tradingview-ta requests
     - name: Run stock analysis
       run: |
         python egx_stock_analysis.py
-
-    - name: Commit and push updated Excel file
+    - name: Commit and push updated Excel file and history archive
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add Stock_Analysis_Output.xlsx
+        git add Stock_Analysis_Output.xlsx stock_history.csv
         git diff --staged --quiet || git commit -m "Daily update: $(date +'%Y-%m-%d %H:%M')"
         git push
