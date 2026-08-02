@@ -21,12 +21,13 @@ Usage:
 
 import argparse
 import logging
+import os
 import random
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,17 @@ SMA_LONG_WINDOW = 200
 EMA_XSHORT_WINDOW = 20
 EMA_SHORT_WINDOW = 50
 EMA_LONG_WINDOW = 200
+
+# Rolling daily history archive - lets the Telegram bot's AI features look at
+# real multi-day trends for ANY stock (not just ones it's been asked about
+# before), rather than only ever seeing a single day's snapshot.
+HISTORY_ARCHIVE_PATH = "history.csv"
+HISTORY_ARCHIVE_MAX_DAYS = 90  # keep the last N distinct trading days
+HISTORY_ARCHIVE_COLUMNS = [
+    "Selected Stock", "Data As Of", "Current EGP Price", "Recommendation",
+    "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
+    "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
+]
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 
@@ -99,6 +111,11 @@ SL_INDICATORS = [               # Priority order for stop loss levels
 # since TradingView's scanner endpoint natively supports multi-symbol queries).
 # This is the real fix for 429s: it cuts ~200 individual requests down to a
 # handful of chunked ones, rather than just spacing out the same volume of calls.
+# Daily history archive (compact per-ticker record kept alongside the Excel
+# output, so trends/history are available beyond just today's snapshot)
+HISTORY_FILENAME = "stock_history.csv"
+HISTORY_RETENTION_DAYS = 400  # a bit over a year, trims the file periodically
+
 TA_EXCHANGE = "EGX"
 TA_SCREENER = "egypt"
 TA_SYMBOLS_PER_REQUEST = 40      # symbols per single scanner request (chunked for safety)
@@ -1036,8 +1053,52 @@ def build_enhanced_recommendation_and_entry(
 
 
 # --------------------------------------------------------------------------
-# Main orchestration
+# Daily history archive
 # --------------------------------------------------------------------------
+
+# Compact set of columns worth keeping long-term (kept small so the archive
+# stays lightweight even after a year+ of daily runs).
+HISTORY_COLUMNS = [
+    "Analysis Run Date", "Selected Stock", "Current EGP Price", "Recommendation",
+    "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
+    "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
+    "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
+    "Optimal Entry Price", "Stop Loss",
+    "Take Profit 1", "Take Profit 2", "Take Profit 3",
+]
+
+
+def append_daily_history(out_df: pd.DataFrame, output_path: str) -> None:
+    """
+    Append today's compact snapshot to a running history CSV (kept next to
+    the Excel output, e.g. stock_history.csv). This is what lets the bot (or
+    anyone) look back at how a stock's recommendation/RSI/price evolved over
+    time, rather than only ever seeing today's snapshot.
+    """
+    history_path = os.path.join(os.path.dirname(os.path.abspath(output_path)) or ".", HISTORY_FILENAME)
+    cols = [c for c in HISTORY_COLUMNS if c in out_df.columns]
+    today_snapshot = out_df[cols].copy()
+
+    if os.path.exists(history_path):
+        try:
+            existing = pd.read_csv(history_path)
+        except Exception as e:
+            log.warning("Could not read existing history file (%s), starting fresh: %s", history_path, e)
+            existing = pd.DataFrame(columns=cols)
+        combined = pd.concat([existing, today_snapshot], ignore_index=True)
+        # De-dupe same ticker/date pairs (keep the latest run if the script
+        # was run more than once on the same day), then trim to a max age.
+        combined.drop_duplicates(subset=["Analysis Run Date", "Selected Stock"], keep="last", inplace=True)
+    else:
+        combined = today_snapshot
+
+    if "Analysis Run Date" in combined.columns:
+        cutoff = (datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        combined = combined[combined["Analysis Run Date"] >= cutoff]
+
+    combined.to_csv(history_path, index=False)
+    log.info("Daily history updated: %s (%d rows)", history_path, len(combined))
+
 
 def run(input_path: str, output_path: str) -> None:
     log.info("Reading ticker list from %s", input_path)
@@ -1100,9 +1161,15 @@ def run(input_path: str, output_path: str) -> None:
         mf = money_flow_volume_analysis(raw, yf_cache)
         sr = support_resistance(raw, yf_cache)
 
-        current_price = val.get("current_egp")  # from yfinance; fallback to TA close
+        # Prefer TradingView's close price - it's the freshest available price.
+        # yfinance's OHLCV data can lag by up to a day depending on the data
+        # provider, so it's kept only as a fallback when TA data is unavailable
+        # for a ticker (valuation/undervaluation math below still uses
+        # yfinance's own aligned history internally, since that needs to match
+        # the FX series day-for-day).
+        current_price = close_ta
         if current_price is None:
-            current_price = close_ta
+            current_price = val.get("current_egp")
 
         # Cross signals from SMA values (TA or fallback)
         golden_cross = None
@@ -1137,6 +1204,7 @@ def run(input_path: str, output_path: str) -> None:
         )
 
         rows.append({
+            "Analysis Run Date": datetime.now().strftime("%Y-%m-%d"),
             "Selected Stock": raw,
             "Data As Of": yf_entry.history.index[-1].strftime("%Y-%m-%d"),
             "Current EGP Price": round(current_price, 4) if current_price is not None else None,
@@ -1187,6 +1255,8 @@ def run(input_path: str, output_path: str) -> None:
     out_df = pd.DataFrame(rows)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name="Stock_Analysis", index=False)
+
+    append_daily_history(out_df, output_path)
 
     log.info("Analysis complete. Output saved to %s", output_path)
 

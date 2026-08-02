@@ -48,6 +48,7 @@ except ImportError:
 
 # GitHub raw URL for your Excel file
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/ARa2of/egx-stock-analysis/main/Stock_Analysis_Output.xlsx"
+GITHUB_HISTORY_URL = "https://raw.githubusercontent.com/ARa2of/egx-stock-analysis/main/stock_history.csv"
 
 # Get token from environment variable
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -199,6 +200,9 @@ cached_data = None
 cache_timestamp = None
 CACHE_DURATION = 300  # 5 minutes cache
 
+cached_history = None
+cached_history_timestamp = None
+
 # Column name mapping for display (updated for new columns)
 COLUMN_DISPLAY = {
     "Selected Stock": "📊 Stock",
@@ -295,6 +299,43 @@ def read_analysis_data() -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.error(f"❌ Error reading Excel: {e}")
         return None
+
+def read_history_data() -> Optional[pd.DataFrame]:
+    """Read the accumulated daily history CSV from GitHub with caching.
+    Returns None (quietly) if the file doesn't exist yet - it's only created
+    once the analysis script has run with the history-archiving feature."""
+    global cached_history, cached_history_timestamp
+
+    if cached_history is not None and cached_history_timestamp is not None:
+        if (datetime.now() - cached_history_timestamp).total_seconds() < CACHE_DURATION:
+            return cached_history
+
+    try:
+        response = requests.get(GITHUB_HISTORY_URL, timeout=10)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        df = pd.read_csv(io.StringIO(response.text))
+        cached_history = df
+        cached_history_timestamp = datetime.now()
+        return df
+    except Exception as e:
+        logger.warning(f"Could not read history CSV: {e}")
+        return None
+
+def format_github_history(ticker: str, limit: int = 20) -> str:
+    """Format the last `limit` archived days for a ticker from the GitHub
+    history CSV - the objective day-by-day record, independent of whether
+    it was ever asked about before."""
+    df = read_history_data()
+    if df is None or df.empty or "Selected Stock" not in df.columns:
+        return ""
+    rows = df[df["Selected Stock"].astype(str).str.upper() == ticker.upper()]
+    if rows.empty:
+        return ""
+    rows = rows.sort_values("Analysis Run Date").tail(limit)
+    cols = [c for c in rows.columns if c != "Selected Stock"]
+    return rows[cols].to_csv(index=False)
 
 def get_stock_data(ticker: str) -> Optional[Dict[str, Any]]:
     """Get data for a specific ticker from the Excel file."""
@@ -793,10 +834,15 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     mentioned_tickers = find_mentioned_tickers(question, df)
     history_text = ""
     if mentioned_tickers:
-        parts = [
-            f"{t}:\n{format_stock_history(get_stock_history(t))}"
-            for t in mentioned_tickers
-        ]
+        parts = []
+        for t in mentioned_tickers:
+            section = [f"{t}:"]
+            gh_hist = format_github_history(t)
+            if gh_hist:
+                section.append(f"Daily archive (price/recommendation/RSI over time):\n{gh_hist}")
+            ai_hist = format_stock_history(get_stock_history(t))
+            section.append(f"Prior AI insights:\n{ai_hist}")
+            parts.append("\n".join(section))
         history_text = "\n\n".join(parts)
 
     data_csv = build_compact_data_summary(df)
