@@ -88,7 +88,8 @@ else:
 # Columns sent to Gemini for analysis (kept compact to minimize token usage)
 GEMINI_SUMMARY_COLUMNS = [
     "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
-    "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
+    "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
+    "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
@@ -236,7 +237,8 @@ COLUMN_DISPLAY = {
     "MACD Signal": "📉 MACD Signal",
     "MACD Bullish (Yes/No)": "📉 MACD Bullish",
     "P/E Ratio (TTM)": "💰 P/E Ratio (TTM)",
-    "Implied Fair Value (EGP)": "🎯 Implied Fair Value",
+    "Implied Fair Value (EGP)": "🎯 Fair Value",
+    "Fair Value Method": "📐 Fair Value Method",
     "Index Membership": "📇 Index Membership",
     "RSI (%)": "📊 RSI",
     "VWMA": "📊 VWMA",  # New column
@@ -602,7 +604,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • Min USD: {format_number(data.get('Historical Min USD Price'))}",
         f"  • Max USD: {format_number(data.get('Historical Max USD Price'))}",
         f"  • {undervalued_emoji} Undervalued: {undervalued}",
-        f"  • 🎯 Implied Fair Value: {format_number(data.get('Implied Fair Value (EGP)'))} EGP",
+        f"  • 🎯 Fair Value: {format_number(data.get('Implied Fair Value (EGP)'))} EGP ({data.get('Fair Value Method', 'N/A')})",
         f"  • 💰 P/E Ratio (TTM): {format_number(data.get('P/E Ratio (TTM)'))}",
         "",
         f"📊 *TECHNICAL INDICATORS:*",

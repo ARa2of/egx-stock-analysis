@@ -437,7 +437,90 @@ def download_fx(period: str = HISTORY_PERIOD) -> Optional[pd.Series]:
 
 
 # --------------------------------------------------------------------------
-# Part 2: USD valuation analysis (MODIFIED: Added P/E-based fair value)
+# Fundamental data from yfinance
+# --------------------------------------------------------------------------
+
+def fetch_fundamentals(raw_ticker: str, yf_ticker: str) -> Optional[dict]:
+    """
+    Fetch fundamental data from yfinance's Ticker.info endpoint.
+    Returns dict with eps, book_value, pe_ratio, sector or None on failure.
+    """
+    try:
+        ticker = yf.Ticker(yf_ticker)
+        info = ticker.info
+        if not info:
+            return None
+
+        eps = info.get("trailingEps")
+        book_value = info.get("bookValue")
+        pe_ratio = info.get("trailingPE")
+        sector = info.get("sector", "Unknown")
+
+        if eps is None:
+            return None
+
+        return {
+            "eps": float(eps) if eps is not None else None,
+            "book_value": float(book_value) if book_value is not None else None,
+            "pe_ratio": float(pe_ratio) if pe_ratio is not None else None,
+            "sector": sector,
+        }
+    except Exception as e:
+        log.debug("%s: Could not fetch fundamentals: %s", raw_ticker, e)
+        return None
+
+
+def compute_fair_value(fundamentals: Optional[dict], current_egp: Optional[float]) -> Tuple[Optional[float], str]:
+    """
+    Compute fair value using Graham Number + PE-based blend.
+
+    Graham Number = sqrt(22.5 * EPS * BookValue)
+    PE-based      = EPS * Stock's Own Trailing PE
+
+    Returns (fair_value_egp, method_label).
+    """
+    if fundamentals is None:
+        return None, "N/A"
+
+    eps = fundamentals.get("eps")
+    book_value = fundamentals.get("book_value")
+    pe_ratio = fundamentals.get("pe_ratio")
+
+    if eps is None or eps <= 0:
+        return None, "N/A (negative earnings)"
+
+    graham_value = None
+    pe_value = None
+
+    # Graham Number (requires positive EPS and book value)
+    if book_value is not None and book_value > 0:
+        graham_value = (22.5 * eps * book_value) ** 0.5
+
+    # PE-based (requires positive EPS and PE)
+    if pe_ratio is not None and pe_ratio > 0:
+        pe_value = eps * pe_ratio
+
+    # Blend available methods
+    if graham_value is not None and pe_value is not None:
+        fair_value = (graham_value + pe_value) / 2
+        method = "Blended (Graham+PE)"
+    elif graham_value is not None:
+        fair_value = graham_value
+        method = "Graham Number"
+    elif pe_value is not None:
+        fair_value = pe_value
+        method = "PE-Based"
+    else:
+        return None, "N/A (insufficient data)"
+
+    if fair_value <= 0:
+        return None, "N/A (negative fair value)"
+
+    return round(fair_value, 4), method
+
+
+# --------------------------------------------------------------------------
+# Part 2: USD valuation analysis + fundamental fair value
 # --------------------------------------------------------------------------
 
 def usd_valuation(
@@ -447,23 +530,23 @@ def usd_valuation(
     ta_cache: Optional[Dict[str, TickerTA]] = None,
 ) -> dict:
     """
-    USD price for each day = EGP close / (EGP per USD) that day. Flags
-    undervaluation by comparing today's USD price to the USD price on
-    historical days when the stock traded at a SIMILAR EGP price (rather
-    than comparing to its own all-time min/max, which would conflate
-    equity moves with currency moves).
-    
-    MODIFIED: Added P/E-based fair value calculation using EPS and fair P/E ratio.
+    Computes current EGP/USD prices and fundamental fair value.
+
+    Fair value is calculated from yfinance fundamentals (Graham Number +
+    PE-based blend).  Undervaluation is flagged when the current EGP price
+    is below the fair value.
+
+    Fallback: when fundamentals are unavailable, uses the historical
+    USD-comparison method (find days with similar EGP price, compare USD).
     """
     result = {
         "current_egp": None, "current_usd": None,
         "hist_min_usd": None, "hist_max_usd": None,
         "undervalued": "No",
         "implied_fair_value_egp": None,
+        "fair_value_method": "N/A",
         "pe_ratio_ttm": None,
         "eps_ttm": None,
-        "fair_value_pe": None,
-        "upside_pe": None,
     }
 
     entry = cache.get(raw_ticker)
@@ -488,55 +571,49 @@ def usd_valuation(
     result.update(current_egp=current_egp, current_usd=current_usd,
                    hist_min_usd=hist_min_usd, hist_max_usd=hist_max_usd)
 
-    # --- P/E-based fair value calculation (NEW) ---
-    # Try to get EPS and P/E from TradingView first
+    # --- Primary: Fundamental fair value from yfinance ---
+    fundamentals = fetch_fundamentals(raw_ticker, entry.yf_ticker)
+    fair_value, method = compute_fair_value(fundamentals, current_egp)
+
+    if fair_value is not None:
+        result["implied_fair_value_egp"] = fair_value
+        result["fair_value_method"] = method
+        if fundamentals:
+            result["pe_ratio_ttm"] = fundamentals.get("pe_ratio")
+            result["eps_ttm"] = fundamentals.get("eps")
+        if current_egp < fair_value:
+            result["undervalued"] = "Yes"
+        log.info("%s: Fair value = %.4f (%s), current = %.4f, undervalued = %s",
+                 raw_ticker, fair_value, method, current_egp, result["undervalued"])
+        return result
+
+    # --- Fallback: USD-comparison method ---
     pe_ratio = None
     eps = None
-    fair_value_pe = None
-    upside_pe = None
-    
     if ta_cache:
         ta_entry = ta_cache.get(raw_ticker)
         if ta_entry and ta_entry.ok:
             ind = ta_entry.indicators
             pe_ratio = ind.get("price_earnings_ttm")
             eps = ind.get("earnings_per_share_basic_ttm")
-    
-    # If we have both EPS and P/E, calculate fair value
-    if eps is not None and pe_ratio is not None and current_egp is not None:
-        # Assumed fair P/E (sector average - can be adjusted)
-        fair_pe = 10.0
-        
-        # Calculate fair value using P/E method
-        fair_value_pe = eps * fair_pe
-        
-        # Calculate upside/downside percentage
-        if fair_value_pe > 0:
-            upside_pe = (fair_value_pe - current_egp) / current_egp * 100
-        
-        result["pe_ratio_ttm"] = pe_ratio
-        result["eps_ttm"] = eps
-        result["fair_value_pe"] = fair_value_pe
-        result["upside_pe"] = upside_pe
-        
-        log.info("%s: P/E-based fair value = %.2f (EPS: %.2f, P/E: %.2f, Upside: %.1f%%)", 
-                 raw_ticker, fair_value_pe, eps, pe_ratio, upside_pe if upside_pe else 0)
+    if eps is not None:
+        result["eps_ttm"] = float(eps)
+    if pe_ratio is not None:
+        result["pe_ratio_ttm"] = float(pe_ratio)
 
-    # --- Original USD-based undervaluation logic (unchanged) ---
     lower = current_egp * (1 - EGP_SIMILARITY_BAND)
     upper = current_egp * (1 + EGP_SIMILARITY_BAND)
     comparable = aligned[(aligned["egp"] >= lower) & (aligned["egp"] <= upper)]
     comparable = comparable.iloc[:-2] if len(comparable) > 2 else comparable
 
-    if len(comparable) >= 5:
+    if len(comparable) >= 10:
         historical_median_usd = float(comparable["usd"].median())
-        # Implied fair value: what today's EGP price would be if the stock
-        # traded at that historical median USD level, at today's FX rate.
-        # This is OUR OWN estimate from comparable historical pricing - not a
-        # TradingView figure, since TradingView doesn't provide a fair value field.
         result["implied_fair_value_egp"] = historical_median_usd * current_fx
+        result["fair_value_method"] = "USD-Comparison (fallback)"
         if current_usd < historical_median_usd:
             result["undervalued"] = "Yes"
+        log.info("%s: Fair value = %.4f (USD-Comparison fallback), current = %.4f",
+                 raw_ticker, result["implied_fair_value_egp"], current_egp)
 
     return result
 
@@ -1401,11 +1478,9 @@ def run(input_path: str, output_path: str) -> None:
             "Historical Max USD Price": round(val["hist_max_usd"], 4) if val["hist_max_usd"] else None,
             "Undervalued (Yes/No)": val["undervalued"],
             "Implied Fair Value (EGP)": round(val["implied_fair_value_egp"], 4) if val["implied_fair_value_egp"] is not None else None,
-            # NEW P/E-based fair value columns
+            "Fair Value Method": val["fair_value_method"],
             "P/E Ratio (TTM)": round(val["pe_ratio_ttm"], 2) if val["pe_ratio_ttm"] is not None else None,
             "EPS (TTM)": round(val["eps_ttm"], 4) if val["eps_ttm"] is not None else None,
-            "Fair Value (P/E-based)": round(val["fair_value_pe"], 4) if val["fair_value_pe"] is not None else None,
-            "Upside/Downside (P/E-based)": round(val["upside_pe"], 1) if val["upside_pe"] is not None else None,
             "1-Year Avg Volume": round(vol["avg_vol_1y"], 0) if vol["avg_vol_1y"] else None,
             "Last Day Volume": round(vol["last_day_vol"], 0) if vol["last_day_vol"] else None,
             "Volume Multiplier (vs 1Y)": vol["vol_multiplier"],
