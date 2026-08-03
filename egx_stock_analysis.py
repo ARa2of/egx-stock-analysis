@@ -440,14 +440,25 @@ def download_fx(period: str = HISTORY_PERIOD) -> Optional[pd.Series]:
 # Fundamental data from yfinance
 # --------------------------------------------------------------------------
 
-def fetch_fundamentals(raw_ticker: str, yf_ticker: str) -> Optional[dict]:
+# Reference PE for EGX stocks (emerging-market conservative average).
+# Used for PE-based fair value when the stock's own trailing PE is available.
+REFERENCE_PE_EGX = 12.0
+
+
+def fetch_fundamentals(raw_ticker: str, yf_ticker: str, current_egp: float) -> Optional[dict]:
     """
     Fetch fundamental data from yfinance's Ticker.info endpoint.
-    Returns dict with eps, book_value, pe_ratio, sector or None on failure.
+
+    EGX stocks often lack ``trailingEps`` but do provide ``trailingPE``
+    and ``bookValue``.  When EPS is missing we derive it from
+    ``current_egp / trailingPE`` so that the Graham Number can still be
+    computed.
+
+    Returns dict with eps, book_value, pe_ratio, sector – or None on failure.
     """
     try:
-        ticker = yf.Ticker(yf_ticker)
-        info = ticker.info
+        ticker_obj = yf.Ticker(yf_ticker)
+        info = ticker_obj.info
         if not info:
             return None
 
@@ -456,11 +467,19 @@ def fetch_fundamentals(raw_ticker: str, yf_ticker: str) -> Optional[dict]:
         pe_ratio = info.get("trailingPE")
         sector = info.get("sector", "Unknown")
 
-        if eps is None:
+        # Derive EPS from price / PE when yfinance doesn't supply it directly
+        if eps is None and pe_ratio is not None and pe_ratio > 0 and current_egp is not None:
+            eps = current_egp / pe_ratio
+            log.debug("%s: Derived EPS %.4f from price %.2f / PE %.2f",
+                      raw_ticker, eps, current_egp, pe_ratio)
+
+        if eps is None or eps <= 0:
+            log.debug("%s: No usable EPS (raw=%s, derived=%s)", raw_ticker,
+                      info.get("trailingEps"), eps)
             return None
 
         return {
-            "eps": float(eps) if eps is not None else None,
+            "eps": float(eps),
             "book_value": float(book_value) if book_value is not None else None,
             "pe_ratio": float(pe_ratio) if pe_ratio is not None else None,
             "sector": sector,
@@ -475,7 +494,7 @@ def compute_fair_value(fundamentals: Optional[dict], current_egp: Optional[float
     Compute fair value using Graham Number + PE-based blend.
 
     Graham Number = sqrt(22.5 * EPS * BookValue)
-    PE-based      = EPS * Stock's Own Trailing PE
+    PE-based      = EPS * Reference PE (12x for EGX emerging market)
 
     Returns (fair_value_egp, method_label).
     """
@@ -484,7 +503,6 @@ def compute_fair_value(fundamentals: Optional[dict], current_egp: Optional[float
 
     eps = fundamentals.get("eps")
     book_value = fundamentals.get("book_value")
-    pe_ratio = fundamentals.get("pe_ratio")
 
     if eps is None or eps <= 0:
         return None, "N/A (negative earnings)"
@@ -496,22 +514,16 @@ def compute_fair_value(fundamentals: Optional[dict], current_egp: Optional[float
     if book_value is not None and book_value > 0:
         graham_value = (22.5 * eps * book_value) ** 0.5
 
-    # PE-based (requires positive EPS and PE)
-    if pe_ratio is not None and pe_ratio > 0:
-        pe_value = eps * pe_ratio
+    # PE-based using reference PE for EGX (not the stock's own PE, which is circular)
+    pe_value = eps * REFERENCE_PE_EGX
 
     # Blend available methods
-    if graham_value is not None and pe_value is not None:
+    if graham_value is not None:
         fair_value = (graham_value + pe_value) / 2
         method = "Blended (Graham+PE)"
-    elif graham_value is not None:
-        fair_value = graham_value
-        method = "Graham Number"
-    elif pe_value is not None:
+    else:
         fair_value = pe_value
         method = "PE-Based"
-    else:
-        return None, "N/A (insufficient data)"
 
     if fair_value <= 0:
         return None, "N/A (negative fair value)"
@@ -572,7 +584,7 @@ def usd_valuation(
                    hist_min_usd=hist_min_usd, hist_max_usd=hist_max_usd)
 
     # --- Primary: Fundamental fair value from yfinance ---
-    fundamentals = fetch_fundamentals(raw_ticker, entry.yf_ticker)
+    fundamentals = fetch_fundamentals(raw_ticker, entry.yf_ticker, current_egp)
     fair_value, method = compute_fair_value(fundamentals, current_egp)
 
     if fair_value is not None:
