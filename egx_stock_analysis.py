@@ -144,7 +144,7 @@ TA_EXTRA_COLUMNS = ["price_earnings_ttm", "earnings_per_share_basic_ttm"]
 INDEX_SYMBOLS = {
     "EGX30": "EGX30",        # EGX 30 - top 30 by liquidity/activity
     "EGX70": "EGX70EWI",     # EGX 70 - equal-weighted index
-    "EGX33": "EGX33",      # EGX 33 Shariah-compliant index
+    "EGX33": "EGX33SHARIAH",      # EGX 33 Shariah-compliant index
 }
 
 # Index membership (which index each stock belongs to, or UNINDEX) is read
