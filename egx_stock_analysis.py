@@ -144,7 +144,7 @@ TA_EXTRA_COLUMNS = ["price_earnings_ttm", "earnings_per_share_basic_ttm"]
 INDEX_SYMBOLS = {
     "EGX30": "EGX30",        # EGX 30 - top 30 by liquidity/activity
     "EGX70": "EGX70EWI",     # EGX 70 - equal-weighted index
-    "EGX33": "EGX33SHARIAH",      # EGX 33 Shariah-compliant index
+    "EGX33": "SHARIAH",      # EGX 33 Shariah-compliant index
 }
 
 # Index membership (which index each stock belongs to, or UNINDEX) is read
@@ -437,13 +437,14 @@ def download_fx(period: str = HISTORY_PERIOD) -> Optional[pd.Series]:
 
 
 # --------------------------------------------------------------------------
-# Part 2: USD valuation analysis (EXACT copy from egx_stock_analysis_2.py)
+# Part 2: USD valuation analysis (MODIFIED: Added P/E-based fair value)
 # --------------------------------------------------------------------------
 
 def usd_valuation(
     raw_ticker: str,
     cache: Dict[str, TickerData],
     fx_series: Optional[pd.Series],
+    ta_cache: Optional[Dict[str, TickerTA]] = None,
 ) -> dict:
     """
     USD price for each day = EGP close / (EGP per USD) that day. Flags
@@ -451,12 +452,18 @@ def usd_valuation(
     historical days when the stock traded at a SIMILAR EGP price (rather
     than comparing to its own all-time min/max, which would conflate
     equity moves with currency moves).
+    
+    MODIFIED: Added P/E-based fair value calculation using EPS and fair P/E ratio.
     """
     result = {
         "current_egp": None, "current_usd": None,
         "hist_min_usd": None, "hist_max_usd": None,
         "undervalued": "No",
         "implied_fair_value_egp": None,
+        "pe_ratio_ttm": None,
+        "eps_ttm": None,
+        "fair_value_pe": None,
+        "upside_pe": None,
     }
 
     entry = cache.get(raw_ticker)
@@ -481,6 +488,41 @@ def usd_valuation(
     result.update(current_egp=current_egp, current_usd=current_usd,
                    hist_min_usd=hist_min_usd, hist_max_usd=hist_max_usd)
 
+    # --- P/E-based fair value calculation (NEW) ---
+    # Try to get EPS and P/E from TradingView first
+    pe_ratio = None
+    eps = None
+    fair_value_pe = None
+    upside_pe = None
+    
+    if ta_cache:
+        ta_entry = ta_cache.get(raw_ticker)
+        if ta_entry and ta_entry.ok:
+            ind = ta_entry.indicators
+            pe_ratio = ind.get("price_earnings_ttm")
+            eps = ind.get("earnings_per_share_basic_ttm")
+    
+    # If we have both EPS and P/E, calculate fair value
+    if eps is not None and pe_ratio is not None and current_egp is not None:
+        # Assumed fair P/E (sector average - can be adjusted)
+        fair_pe = 10.0
+        
+        # Calculate fair value using P/E method
+        fair_value_pe = eps * fair_pe
+        
+        # Calculate upside/downside percentage
+        if fair_value_pe > 0:
+            upside_pe = (fair_value_pe - current_egp) / current_egp * 100
+        
+        result["pe_ratio_ttm"] = pe_ratio
+        result["eps_ttm"] = eps
+        result["fair_value_pe"] = fair_value_pe
+        result["upside_pe"] = upside_pe
+        
+        log.info("%s: P/E-based fair value = %.2f (EPS: %.2f, P/E: %.2f, Upside: %.1f%%)", 
+                 raw_ticker, fair_value_pe, eps, pe_ratio, upside_pe if upside_pe else 0)
+
+    # --- Original USD-based undervaluation logic (unchanged) ---
     lower = current_egp * (1 - EGP_SIMILARITY_BAND)
     upper = current_egp * (1 + EGP_SIMILARITY_BAND)
     comparable = aligned[(aligned["egp"] >= lower) & (aligned["egp"] <= upper)]
@@ -1295,7 +1337,8 @@ def run(input_path: str, output_path: str) -> None:
             ind = {}  # Empty indicators for fallback
 
         # Compute custom analytics from yfinance
-        val = usd_valuation(raw, yf_cache, fx_series)
+        # MODIFIED: Pass ta_cache to usd_valuation for P/E-based fair value
+        val = usd_valuation(raw, yf_cache, fx_series, ta_cache)
         vol = volume_analysis(raw, yf_cache, ta_cache)  # Pass ta_cache for volume
         mf = money_flow_volume_analysis(raw, yf_cache)
         sr = support_resistance(raw, yf_cache)
@@ -1358,6 +1401,11 @@ def run(input_path: str, output_path: str) -> None:
             "Historical Max USD Price": round(val["hist_max_usd"], 4) if val["hist_max_usd"] else None,
             "Undervalued (Yes/No)": val["undervalued"],
             "Implied Fair Value (EGP)": round(val["implied_fair_value_egp"], 4) if val["implied_fair_value_egp"] is not None else None,
+            # NEW P/E-based fair value columns
+            "P/E Ratio (TTM)": round(val["pe_ratio_ttm"], 2) if val["pe_ratio_ttm"] is not None else None,
+            "EPS (TTM)": round(val["eps_ttm"], 4) if val["eps_ttm"] is not None else None,
+            "Fair Value (P/E-based)": round(val["fair_value_pe"], 4) if val["fair_value_pe"] is not None else None,
+            "Upside/Downside (P/E-based)": round(val["upside_pe"], 1) if val["upside_pe"] is not None else None,
             "1-Year Avg Volume": round(vol["avg_vol_1y"], 0) if vol["avg_vol_1y"] else None,
             "Last Day Volume": round(vol["last_day_vol"], 0) if vol["last_day_vol"] else None,
             "Volume Multiplier (vs 1Y)": vol["vol_multiplier"],
@@ -1378,7 +1426,6 @@ def run(input_path: str, output_path: str) -> None:
             "MACD": round(macd, 4) if macd is not None else None,
             "MACD Signal": round(macd_signal, 4) if macd_signal is not None else None,
             "MACD Bullish (Yes/No)": macd_bullish,
-            "P/E Ratio (TTM)": round(pe_ratio, 2) if pe_ratio is not None else None,
             "RSI (%)": round(rsi, 2) if rsi is not None else None,
             "VWMA": round(vwma, 4) if vwma is not None else None,  # New column for VWMA
             "TA Data As Of": ta_fetch_time,  # New column for TA fetch time
