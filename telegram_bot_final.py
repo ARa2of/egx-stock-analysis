@@ -87,7 +87,7 @@ else:
 
 # Columns sent to Gemini for analysis (kept compact to minimize token usage)
 GEMINI_SUMMARY_COLUMNS = [
-    "Selected Stock", "Current EGP Price", "Recommendation",
+    "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
     "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
@@ -203,6 +203,9 @@ CACHE_DURATION = 300  # 5 minutes cache
 cached_history = None
 cached_history_timestamp = None
 
+cached_indices = None
+cached_indices_timestamp = None
+
 # Column name mapping for display (updated for new columns)
 COLUMN_DISPLAY = {
     "Selected Stock": "📊 Stock",
@@ -229,6 +232,12 @@ COLUMN_DISPLAY = {
     "200 EMA": "📈 200 EMA",
     "EMA Bullish (50>200) (Yes/No)": "📈 EMA Bullish",
     "Diamond Cross (20>50) (Yes/No)": "💠 Diamond Cross",
+    "MACD": "📉 MACD",
+    "MACD Signal": "📉 MACD Signal",
+    "MACD Bullish (Yes/No)": "📉 MACD Bullish",
+    "P/E Ratio (TTM)": "💰 P/E Ratio (TTM)",
+    "Implied Fair Value (EGP)": "🎯 Implied Fair Value",
+    "Index Membership": "📇 Index Membership",
     "RSI (%)": "📊 RSI",
     "VWMA": "📊 VWMA",  # New column
     "TA Data As Of": "🕐 TA Data",  # New column
@@ -298,6 +307,27 @@ def read_analysis_data() -> Optional[pd.DataFrame]:
         return None
     except Exception as e:
         logger.error(f"❌ Error reading Excel: {e}")
+        return None
+
+def read_indices_data() -> Optional[pd.DataFrame]:
+    """Read the Indices sheet (EGX30/EGX70/EGX33 snapshot) from GitHub with caching."""
+    global cached_indices, cached_indices_timestamp
+
+    if cached_indices is not None and cached_indices_timestamp is not None:
+        if (datetime.now() - cached_indices_timestamp).total_seconds() < CACHE_DURATION:
+            return cached_indices
+
+    try:
+        response = requests.get(GITHUB_RAW_URL, timeout=10)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        df = pd.read_excel(io.BytesIO(response.content), sheet_name="Indices")
+        cached_indices = df
+        cached_indices_timestamp = datetime.now()
+        return df
+    except Exception as e:
+        logger.warning(f"Could not read Indices sheet: {e}")
         return None
 
 def read_history_data() -> Optional[pd.DataFrame]:
@@ -386,18 +416,40 @@ def build_compact_data_summary(df: pd.DataFrame, max_basis_chars: int = 100) -> 
     return compact.to_csv(index=False)
 
 
-def build_ask_prompt(data_csv: str, question: str, history_text: str = "") -> str:
+def build_index_summary() -> str:
+    """Compact CSV of the EGX30/EGX70/EGX33 index snapshot, so the AI can
+    weigh a stock's own index performance alongside its individual data.
+    Returns "" if the Indices sheet isn't available (e.g. older Excel file)."""
+    df = read_indices_data()
+    if df is None or df.empty:
+        return ""
+    return df.to_csv(index=False)
+
+
+def build_ask_prompt(data_csv: str, question: str, history_text: str = "", index_csv: str = "") -> str:
     history_section = (
         f"\nPRIOR HISTORY FOR STOCKS MENTIONED IN THE QUESTION:\n{history_text}\n"
         if history_text else ""
+    )
+    index_section = (
+        f"\nEGX INDEX SNAPSHOT (EGX30/EGX70/EGX33):\n{index_csv}\n"
+        if index_csv else ""
     )
     return (
         "You are an analytical assistant for an Egyptian Exchange (EGX) stock "
         "portfolio. Below is the latest daily technical analysis data for all "
         "tracked stocks in CSV format.\n\n"
         f"DATA:\n{data_csv}\n"
-        f"{history_section}\n"
+        f"{history_section}"
+        f"{index_section}\n"
         f"QUESTION: {question}\n\n"
+        "Each stock's DATA row has an 'Index Membership' field (EGX30, EGX70, "
+        "EGX33, or UNINDEX). When discussing a stock, weigh how its own index "
+        "is moving (from the EGX INDEX SNAPSHOT, if given) alongside its "
+        "individual technicals - a stock in a rising index has extra tailwind, "
+        "one in a falling index is swimming against the current. UNINDEX just "
+        "means it isn't tracked by a major index - that's a neutral fact, not "
+        "a negative signal, so don't treat it as a strike against the stock.\n\n"
         "Use the DATA as the source of truth for prices, recommendations, and "
         "technical indicators - don't contradict or invent figures that differ "
         "from it. Beyond that, be genuinely analytical: draw on your general "
@@ -410,10 +462,14 @@ def build_ask_prompt(data_csv: str, question: str, history_text: str = "") -> st
     )
 
 
-def build_daily_report_prompt(data_csv: str, report_history_text: str = "", searched: bool = False) -> str:
+def build_daily_report_prompt(data_csv: str, report_history_text: str = "", searched: bool = False, index_csv: str = "") -> str:
     history_section = (
         f"\nPRIOR RECENT REPORTS (for context - note what changed since then):\n{report_history_text}\n"
         if report_history_text else ""
+    )
+    index_section = (
+        f"\nEGX INDEX SNAPSHOT (EGX30/EGX70/EGX33):\n{index_csv}\n"
+        if index_csv else ""
     )
     search_line = (
         "Use search to check for recent news, sector trends, or macro/EGP "
@@ -426,19 +482,25 @@ def build_daily_report_prompt(data_csv: str, report_history_text: str = "", sear
         "stock scan. Below is the full dataset in CSV format for all tracked "
         "stocks.\n\n"
         f"DATA:\n{data_csv}\n"
-        f"{history_section}\n"
+        f"{history_section}"
+        f"{index_section}\n"
         "Task: identify the stocks with the strongest potential to increase in "
         "price in the near term. Use the technical signals in the DATA "
         "(Recommendation, Golden/Diamond Cross status, RSI level, volume/buy-"
         "volume multipliers, proximity to support, risk/reward on take-profit "
         "levels) as your primary evidence, and bring in your general market "
         "knowledge and reasoning (sector context, typical EGX behavior, "
-        "macro conditions) to give a genuinely analytical view rather than a "
-        f"plain restatement of the numbers.\n\n{search_line}"
+        f"macro conditions) to give a genuinely analytical view.\n\n{search_line}"
+        "Each stock has an 'Index Membership' field (EGX30, EGX70, EGX33, or "
+        "UNINDEX). Cross-reference this against the EGX INDEX SNAPSHOT (if "
+        "given) - a stock in a currently rising index has an extra tailwind "
+        "worth noting; one in a falling index is worth flagging as swimming "
+        "against the tide. UNINDEX is a neutral fact, not a mark against a "
+        "stock - don't penalize it for that alone.\n\n"
         "Produce a short report for Telegram with:\n"
         "1. A ranked shortlist (top 5-8) of the most promising tickers, each with "
-        "a rationale that combines the technical data with your broader "
-        "reasoning.\n"
+        "a rationale that combines the technical data, its index context, and "
+        "your broader reasoning.\n"
         "2. A brief note on any stocks flashing warning signs (e.g. Death Cross, "
         "RSI overbought).\n"
         "3. If prior reports are given, a short 'what changed' note (new entries "
@@ -513,6 +575,11 @@ def format_stock_response(data: Dict[str, Any]) -> str:
 
     diamond_cross = data.get("Diamond Cross (20>50) (Yes/No)", "No")
     diamond_emoji = "💠" if diamond_cross == "Yes" else "❌"
+
+    macd_bullish = data.get("MACD Bullish (Yes/No)", "No")
+    macd_emoji = "✅" if macd_bullish == "Yes" else "❌"
+
+    index_membership = data.get("Index Membership") or "None"
     
     # SMA50 > SMA200 check
     sma50 = data.get("50 SMA")
@@ -521,6 +588,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
     
     lines = [
         f"📊 *{data.get('Selected Stock', 'Unknown')}*",
+        f"📇 *Index Membership:* {index_membership}",
         f"{'=' * 30}",
         f"📅 *Data:* {data.get('Data As Of', 'N/A')}",
         f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
@@ -534,6 +602,8 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • Min USD: {format_number(data.get('Historical Min USD Price'))}",
         f"  • Max USD: {format_number(data.get('Historical Max USD Price'))}",
         f"  • {undervalued_emoji} Undervalued: {undervalued}",
+        f"  • 🎯 Implied Fair Value: {format_number(data.get('Implied Fair Value (EGP)'))} EGP",
+        f"  • 💰 P/E Ratio (TTM): {format_number(data.get('P/E Ratio (TTM)'))}",
         "",
         f"📊 *TECHNICAL INDICATORS:*",
         f"  • 50 SMA: {format_number(data.get('50 SMA'))}",
@@ -546,6 +616,9 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • 200 EMA: {format_number(data.get('200 EMA'))}",
         f"  • {ema_emoji} EMA Bullish (50>200): {ema_bullish}",
         f"  • {diamond_emoji} Diamond Cross (20>50): {diamond_cross}",
+        f"  • MACD: {format_number(data.get('MACD'), 4)}",
+        f"  • MACD Signal: {format_number(data.get('MACD Signal'), 4)}",
+        f"  • {macd_emoji} MACD Bullish: {macd_bullish}",
         f"  • RSI: {format_number(data.get('RSI (%)'))}",
         f"  • VWMA: {format_number(data.get('VWMA'))}",  # New VWMA line
         "",
@@ -622,6 +695,7 @@ Hi {user.first_name}! I read your Excel analysis and provide detailed stock reco
 /report - Get the latest Excel report URL
 /refresh - Reload data from GitHub
 /status - Check when data was last updated
+/indices - Show EGX30/EGX70/EGX33 index snapshot
 /ask <question> - Ask AI about any stock(s), e.g. "/ask how does COMI look?"
 /aireport - Get an AI-generated shortlist of the strongest stocks right now
 /help - Show this help
@@ -751,6 +825,31 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         await update.message.reply_text(summary, parse_mode="Markdown")
 
+async def indices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the latest EGX30/EGX70/EGX33 index snapshot."""
+    df = read_indices_data()
+    if df is None or df.empty:
+        await update.message.reply_text(
+            "❌ Could not read index data. Make sure the analysis script has "
+            "run at least once with index tracking enabled."
+        )
+        return
+
+    lines = ["📊 *EGX Index Snapshot*\n"]
+    for _, row in df.iterrows():
+        if row.get("Status") != "ok":
+            lines.append(f"*{row.get('Index')}*: fetch failed\n")
+            continue
+        macd_emoji = "✅" if row.get("MACD Bullish (Yes/No)") == "Yes" else "❌"
+        lines.append(
+            f"*{row.get('Index')}*\n"
+            f"  • Close: {format_number(row.get('Close'))}\n"
+            f"  • Change: {format_number(row.get('Change (%)'))}%\n"
+            f"  • RSI: {format_number(row.get('RSI (%)'))}\n"
+            f"  • {macd_emoji} MACD Bullish: {row.get('MACD Bullish (Yes/No)')}\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Check data status."""
     global cache_timestamp
@@ -846,7 +945,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         history_text = "\n\n".join(parts)
 
     data_csv = build_compact_data_summary(df)
-    prompt = build_ask_prompt(data_csv, question, history_text)
+    prompt = build_ask_prompt(data_csv, question, history_text, index_csv=build_index_summary())
 
     try:
         answer = await asyncio.to_thread(call_gemini, prompt, use_search)
@@ -899,7 +998,7 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     data_csv = build_compact_data_summary(df)
     report_history_text = format_report_history(get_recent_reports())
-    prompt = build_daily_report_prompt(data_csv, report_history_text, searched=use_search)
+    prompt = build_daily_report_prompt(data_csv, report_history_text, searched=use_search, index_csv=build_index_summary())
 
     try:
         report = await asyncio.to_thread(call_gemini, prompt, use_search)
@@ -941,6 +1040,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 /status - Check when data was last updated
   Shows cache status and next update time
+
+/indices - Show EGX30/EGX70/EGX33 index snapshot
+  Close, change, RSI, and MACD status for each index
 
 /ask <question> - Ask AI about any stock(s) or the portfolio
   Example: /ask which stocks look strongest right now?
@@ -1014,6 +1116,7 @@ def main():
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("indices", indices_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("aireport", ai_report_command))
     application.add_handler(CommandHandler("myid", myid_command))

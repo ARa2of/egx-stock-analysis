@@ -42,7 +42,17 @@ from tradingview_ta import Interval, TradingView
 HISTORY_PERIOD = "10y"
 MIN_TRADING_DAYS = 30
 EGX_SUFFIX = ".CA"
-AUTO_ADJUST = False
+# Split/dividend-adjusted prices from yfinance. Without this, a stock split
+# leaves a phantom "cliff" in the raw price history (e.g. a 2:1 split makes
+# every pre-split price look 2x too high relative to today's price). That
+# cliff previously fed into: the USD undervaluation check and implied fair
+# value (comparing today's price to a distorted historical range), the
+# Historical Min/Max USD Price columns, support/resistance swing detection,
+# and the SMA/EMA/RSI/MACD fallback calculations used when TradingView data
+# is unavailable for a ticker. TradingView's own indicators (used when
+# available) are already split-adjusted on their end, so this specifically
+# fixes our own yfinance-derived calculations.
+AUTO_ADJUST = True
 FRESHNESS_CHECK_PERIOD = "5d"
 STALE_DATA_WARNING_DAYS = 4
 FX_TICKER = "EGP=X"
@@ -55,6 +65,9 @@ SMA_LONG_WINDOW = 200
 EMA_XSHORT_WINDOW = 20
 EMA_SHORT_WINDOW = 50
 EMA_LONG_WINDOW = 200
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # Rolling daily history archive - lets the Telegram bot's AI features look at
 # real multi-day trends for ANY stock (not just ones it's been asked about
@@ -118,6 +131,25 @@ HISTORY_RETENTION_DAYS = 400  # a bit over a year, trims the file periodically
 
 TA_EXCHANGE = "EGX"
 TA_SCREENER = "egypt"
+# Fundamental fields TradingView's scanner supports but the library's default
+# indicator list doesn't include - requested explicitly alongside it.
+TA_EXTRA_COLUMNS = ["price_earnings_ttm", "earnings_per_share_basic_ttm"]
+
+# --------------------------------------------------------------------------
+# EGX index tracking
+# --------------------------------------------------------------------------
+
+# TradingView symbols for the major EGX indices (all under the "EGX:" exchange,
+# same as individual stocks, so they can be fetched with the same batch logic).
+INDEX_SYMBOLS = {
+    "EGX30": "EGX30",        # EGX 30 - top 30 by liquidity/activity
+    "EGX70": "EGX70EWI",     # EGX 70 - equal-weighted index
+    "EGX33": "SHARIAH",      # EGX 33 Shariah-compliant index
+}
+
+# Index membership (which index each stock belongs to, or UNINDEX) is read
+# directly from the 'INDEX' column in the input file's Selected_Stocks sheet,
+# maintained manually each quarter - see read_ticker_index_map().
 TA_SYMBOLS_PER_REQUEST = 40      # symbols per single scanner request (chunked for safety)
 TA_BATCH_RETRIES = 4             # retries per chunk on failure/429
 TA_BATCH_RETRY_DELAY = 5         # base seconds, doubles each retry (5,10,20,40)
@@ -179,6 +211,44 @@ def read_ticker_list(path: str, sheet_name: str) -> list:
             seen.add(t)
             ordered.append(t)
     return ordered
+
+
+def read_ticker_index_map(path: str, sheet_name: str) -> Dict[str, str]:
+    """
+    Read the 'INDEX' column (column B in Selected_Stocks) mapping each ticker
+    to EGX30 / EGX33 / EGX70 / UNINDEX, as maintained manually each quarter.
+    Returns {} (and logs a warning) if the column doesn't exist yet - the
+    script still runs fine without it, just with a blank Index Membership.
+    """
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name)
+    except Exception as e:
+        log.warning("Could not read '%s' sheet for index mapping: %s", sheet_name, e)
+        return {}
+
+    if df.empty or df.shape[1] < 1:
+        return {}
+
+    ticker_col = df.columns[0]
+    index_col = next((c for c in df.columns[1:] if str(c).strip().upper() == "INDEX"), None)
+    if index_col is None:
+        log.warning(
+            "No 'INDEX' column found in '%s' - Index Membership will be blank for all stocks.",
+            sheet_name
+        )
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        raw = row.get(ticker_col)
+        if pd.isna(raw):
+            continue
+        ticker = str(raw).strip().upper()
+        if not ticker:
+            continue
+        idx_val = row.get(index_col)
+        mapping[ticker] = str(idx_val).strip().upper() if not pd.isna(idx_val) else "UNINDEX"
+    return mapping
 
 
 def to_yf_ticker(raw: str) -> str:
@@ -253,7 +323,10 @@ def fetch_ta_chunk_raw(symbols: List[str]) -> Dict[str, Optional[dict]]:
     """
     scan_url = f"{TradingView.scan_url}{TA_SCREENER.lower()}/scan"
     tv_symbols = [f"{TA_EXCHANGE}:{s}" for s in symbols]
-    indicator_columns = TradingView.indicators
+    # Default technical indicators (RSI, EMA/SMA, MACD, etc.) plus a couple of
+    # fundamental columns TradingView's scanner supports but tradingview_ta's
+    # default list doesn't include.
+    indicator_columns = TradingView.indicators + TA_EXTRA_COLUMNS
     payload = {
         "symbols": {"tickers": [s.upper() for s in tv_symbols], "query": {"types": []}},
         "columns": indicator_columns,
@@ -383,6 +456,7 @@ def usd_valuation(
         "current_egp": None, "current_usd": None,
         "hist_min_usd": None, "hist_max_usd": None,
         "undervalued": "No",
+        "implied_fair_value_egp": None,
     }
 
     entry = cache.get(raw_ticker)
@@ -400,6 +474,7 @@ def usd_valuation(
 
     current_egp = float(aligned["egp"].iloc[-1])
     current_usd = float(aligned["usd"].iloc[-1])
+    current_fx = float(aligned["fx"].iloc[-1])
     hist_min_usd = float(aligned["usd"].min())
     hist_max_usd = float(aligned["usd"].max())
 
@@ -413,6 +488,11 @@ def usd_valuation(
 
     if len(comparable) >= 5:
         historical_median_usd = float(comparable["usd"].median())
+        # Implied fair value: what today's EGP price would be if the stock
+        # traded at that historical median USD level, at today's FX rate.
+        # This is OUR OWN estimate from comparable historical pricing - not a
+        # TradingView figure, since TradingView doesn't provide a fair value field.
+        result["implied_fair_value_egp"] = historical_median_usd * current_fx
         if current_usd < historical_median_usd:
             result["undervalued"] = "Yes"
 
@@ -847,7 +927,10 @@ def calculate_risk_reward(
 
 def compute_sma_ema_rsi_from_yf(history: pd.DataFrame) -> dict:
     close = history["Close"].dropna()
-    result = {"sma50": None, "sma200": None, "ema20": None, "ema50": None, "ema200": None, "rsi": None}
+    result = {
+        "sma50": None, "sma200": None, "ema20": None, "ema50": None, "ema200": None,
+        "rsi": None, "macd": None, "macd_signal": None,
+    }
 
     if len(close) >= EMA_XSHORT_WINDOW:
         result["ema20"] = float(close.ewm(span=EMA_XSHORT_WINDOW, adjust=False).mean().iloc[-1])
@@ -872,6 +955,15 @@ def compute_sma_ema_rsi_from_yf(history: pd.DataFrame) -> dict:
         last_rsi = rsi.iloc[-1]
         if not pd.isna(last_rsi):
             result["rsi"] = float(last_rsi)
+
+    # MACD (standard 12/26 EMA difference, 9-period signal line)
+    if len(close) >= MACD_SLOW + MACD_SIGNAL:
+        ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+        ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+        result["macd"] = float(macd_line.iloc[-1])
+        result["macd_signal"] = float(signal_line.iloc[-1])
 
     return result
 
@@ -1059,7 +1151,7 @@ def build_enhanced_recommendation_and_entry(
 # Compact set of columns worth keeping long-term (kept small so the archive
 # stays lightweight even after a year+ of daily runs).
 HISTORY_COLUMNS = [
-    "Analysis Run Date", "Selected Stock", "Current EGP Price", "Recommendation",
+    "Analysis Run Date", "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
     "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
@@ -1100,11 +1192,52 @@ def append_daily_history(out_df: pd.DataFrame, output_path: str) -> None:
     log.info("Daily history updated: %s (%d rows)", history_path, len(combined))
 
 
+def fetch_index_snapshot() -> pd.DataFrame:
+    """
+    Fetch current values for EGX30, EGX70, and EGX33 using the same batched
+    TradingView fetch already used for individual stocks (indices are just
+    symbols under the same "EGX:" exchange, so no special-casing needed).
+    """
+    raw_symbols = list(INDEX_SYMBOLS.values())
+    ta_cache: Dict[str, TickerTA] = {}
+    fetch_all_ta(raw_symbols, ta_cache)
+
+    rows = []
+    for friendly_name, symbol in INDEX_SYMBOLS.items():
+        entry = ta_cache.get(symbol)
+        if entry is None or not entry.ok:
+            rows.append({"Index": friendly_name, "TradingView Symbol": symbol, "Status": "fetch failed"})
+            continue
+        ind = entry.indicators
+        macd = ind.get("MACD.macd")
+        macd_signal = ind.get("MACD.signal")
+        rows.append({
+            "Index": friendly_name,
+            "TradingView Symbol": symbol,
+            "Status": "ok",
+            "Close": round(ind.get("close"), 2) if ind.get("close") is not None else None,
+            "Change (%)": round(ind.get("change"), 2) if ind.get("change") is not None else None,
+            "RSI (%)": round(ind.get("RSI"), 2) if ind.get("RSI") is not None else None,
+            "50 SMA": round(ind.get("SMA50"), 2) if ind.get("SMA50") is not None else None,
+            "200 SMA": round(ind.get("SMA200"), 2) if ind.get("SMA200") is not None else None,
+            "20 EMA": round(ind.get("EMA20"), 2) if ind.get("EMA20") is not None else None,
+            "50 EMA": round(ind.get("EMA50"), 2) if ind.get("EMA50") is not None else None,
+            "200 EMA": round(ind.get("EMA200"), 2) if ind.get("EMA200") is not None else None,
+            "MACD": round(macd, 2) if macd is not None else None,
+            "MACD Signal": round(macd_signal, 2) if macd_signal is not None else None,
+            "MACD Bullish (Yes/No)": ("Yes" if macd > macd_signal else "No") if (macd is not None and macd_signal is not None) else None,
+            "Data Fetched": entry.fetch_time.strftime("%Y-%m-%d %H:%M:%S") if entry.fetch_time else None,
+        })
+    return pd.DataFrame(rows)
+
+
 def run(input_path: str, output_path: str) -> None:
     log.info("Reading ticker list from %s", input_path)
     tickers = read_ticker_list(input_path, "Selected_Stocks")
     if not tickers:
         raise ValueError("No tickers found in 'Selected_Stocks'.")
+
+    index_map = read_ticker_index_map(input_path, "Selected_Stocks")
 
     # 1. yfinance OHLCV
     yf_cache: Dict[str, TickerData] = {}
@@ -1139,6 +1272,9 @@ def run(input_path: str, output_path: str) -> None:
             rsi = ind.get("RSI")
             close_ta = ind.get("close")
             vwma = ind.get("VWMA")  # Get VWMA from TA
+            macd = ind.get("MACD.macd")
+            macd_signal = ind.get("MACD.signal")
+            pe_ratio = ind.get("price_earnings_ttm")
             ta_fetch_time = ta_entry.fetch_time.strftime("%Y-%m-%d %H:%M:%S") if ta_entry.fetch_time else None
         else:
             # Fallback: compute from yfinance
@@ -1152,6 +1288,9 @@ def run(input_path: str, output_path: str) -> None:
             rsi = fallback["rsi"]
             close_ta = None
             vwma = None  # No VWMA from yfinance fallback
+            macd = fallback["macd"]
+            macd_signal = fallback["macd_signal"]
+            pe_ratio = None  # No P/E fallback source (yfinance history has no earnings data)
             ta_fetch_time = None
             ind = {}  # Empty indicators for fallback
 
@@ -1194,6 +1333,11 @@ def run(input_path: str, output_path: str) -> None:
         if ema20 is not None and ema50 is not None:
             diamond_cross = "Yes" if ema20 > ema50 else "No"
 
+        # MACD Bullish: MACD line above its signal line
+        macd_bullish = None
+        if macd is not None and macd_signal is not None:
+            macd_bullish = "Yes" if macd > macd_signal else "No"
+
         # Enhanced Recommendation & Entry
         rec = build_enhanced_recommendation_and_entry(
             val, mf, sr, ind, current_price,
@@ -1206,12 +1350,14 @@ def run(input_path: str, output_path: str) -> None:
         rows.append({
             "Analysis Run Date": datetime.now().strftime("%Y-%m-%d"),
             "Selected Stock": raw,
+            "Index Membership": index_map.get(raw, "UNINDEX"),
             "Data As Of": yf_entry.history.index[-1].strftime("%Y-%m-%d"),
             "Current EGP Price": round(current_price, 4) if current_price is not None else None,
             "Current USD Price": round(val["current_usd"], 4) if val["current_usd"] is not None else None,
             "Historical Min USD Price": round(val["hist_min_usd"], 4) if val["hist_min_usd"] else None,
             "Historical Max USD Price": round(val["hist_max_usd"], 4) if val["hist_max_usd"] else None,
             "Undervalued (Yes/No)": val["undervalued"],
+            "Implied Fair Value (EGP)": round(val["implied_fair_value_egp"], 4) if val["implied_fair_value_egp"] is not None else None,
             "1-Year Avg Volume": round(vol["avg_vol_1y"], 0) if vol["avg_vol_1y"] else None,
             "Last Day Volume": round(vol["last_day_vol"], 0) if vol["last_day_vol"] else None,
             "Volume Multiplier (vs 1Y)": vol["vol_multiplier"],
@@ -1229,6 +1375,10 @@ def run(input_path: str, output_path: str) -> None:
             "200 EMA": round(ema200, 4) if ema200 is not None else None,
             "EMA Bullish (50>200) (Yes/No)": ema_bullish,
             "Diamond Cross (20>50) (Yes/No)": diamond_cross,
+            "MACD": round(macd, 4) if macd is not None else None,
+            "MACD Signal": round(macd_signal, 4) if macd_signal is not None else None,
+            "MACD Bullish (Yes/No)": macd_bullish,
+            "P/E Ratio (TTM)": round(pe_ratio, 2) if pe_ratio is not None else None,
             "RSI (%)": round(rsi, 2) if rsi is not None else None,
             "VWMA": round(vwma, 4) if vwma is not None else None,  # New column for VWMA
             "TA Data As Of": ta_fetch_time,  # New column for TA fetch time
@@ -1253,8 +1403,13 @@ def run(input_path: str, output_path: str) -> None:
         raise RuntimeError("No valid tickers to output; check logs.")
 
     out_df = pd.DataFrame(rows)
+
+    log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
+    index_df = fetch_index_snapshot()
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name="Stock_Analysis", index=False)
+        index_df.to_excel(writer, sheet_name="Indices", index=False)
 
     append_daily_history(out_df, output_path)
 
