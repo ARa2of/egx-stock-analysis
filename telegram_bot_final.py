@@ -196,6 +196,135 @@ def find_mentioned_tickers(question: str, df: pd.DataFrame) -> list:
     q_upper = question.upper()
     return [t for t in tickers if re.search(rf"\b{re.escape(t)}\b", q_upper)]
 
+
+# --------------------------------------------------------------------------
+# Wallet / Portfolio persistence
+# --------------------------------------------------------------------------
+
+WALLET_PATH = os.environ.get(
+    "WALLET_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallet.json"),
+)
+
+
+def _load_wallet() -> dict:
+    try:
+        with open(WALLET_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_wallet(wallet: dict) -> None:
+    try:
+        with open(WALLET_PATH, "w", encoding="utf-8") as f:
+            json.dump(wallet, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"Failed to save wallet: {e}")
+
+
+def _get_chat_wallet(chat_id: int) -> dict:
+    wallet = _load_wallet()
+    return wallet.get(str(chat_id), {"holdings": {}})
+
+
+def _save_chat_wallet(chat_id: int, data: dict) -> None:
+    wallet = _load_wallet()
+    wallet[str(chat_id)] = data
+    _save_wallet(wallet)
+
+
+def add_holding(chat_id: int, ticker: str, qty: float, avg_price: float) -> str:
+    ticker = ticker.upper()
+    data = _get_chat_wallet(chat_id)
+    holdings = data.setdefault("holdings", {})
+    if ticker in holdings:
+        old = holdings[ticker]
+        old_qty = old["qty"]
+        old_avg = old["avg_price"]
+        new_qty = old_qty + qty
+        new_avg = ((old_qty * old_avg) + (qty * avg_price)) / new_qty
+        holdings[ticker] = {"qty": new_qty, "avg_price": round(new_avg, 4)}
+        _save_chat_wallet(chat_id, data)
+        return f"Updated {ticker}: {new_qty} shares @ {new_avg:.2f} EGP (was {old_qty} @ {old_avg:.2f})"
+    else:
+        holdings[ticker] = {"qty": qty, "avg_price": round(avg_price, 4)}
+        _save_chat_wallet(chat_id, data)
+        return f"Added {ticker}: {qty} shares @ {avg_price:.2f} EGP"
+
+
+def remove_holding(chat_id: int, ticker: str) -> str:
+    ticker = ticker.upper()
+    data = _get_chat_wallet(chat_id)
+    holdings = data.get("holdings", {})
+    if ticker not in holdings:
+        return f"{ticker} not found in your portfolio."
+    del holdings[ticker]
+    _save_chat_wallet(chat_id, data)
+    return f"Removed {ticker} from your portfolio."
+
+
+def get_holdings(chat_id: int) -> dict:
+    data = _get_chat_wallet(chat_id)
+    return data.get("holdings", {})
+
+
+def clear_wallet(chat_id: int) -> str:
+    _save_chat_wallet(chat_id, {"holdings": {}})
+    return "Portfolio cleared."
+
+
+def format_portfolio(holdings: dict, df: pd.DataFrame) -> str:
+    if not holdings:
+        return "💰 Your portfolio is empty.\n\nUse /manage add TICKER QTY AVG_PRICE to add stocks."
+
+    lines = ["💰 *MY PORTFOLIO*", "=" * 30, ""]
+    total_invested = 0.0
+    total_current = 0.0
+
+    for ticker, info in holdings.items():
+        qty = info["qty"]
+        avg_price = info["avg_price"]
+        invested = qty * avg_price
+        total_invested += invested
+
+        current_price = None
+        if df is not None:
+            row = df[df["Selected Stock"] == ticker]
+            if not row.empty:
+                current_price = row.iloc[0].get("Current EGP Price")
+                rec = row.iloc[0].get("Recommendation", "")
+                rec_emoji = {"Buy": "🟢", "Watch": "🟡", "Hold": "🔵", "Avoid": "🔴"}.get(rec, "⚪")
+            else:
+                rec_emoji = "⚪"
+        else:
+            rec_emoji = "⚪"
+
+        if current_price is not None and not pd.isna(current_price):
+            current_val = qty * current_price
+            total_current += current_val
+            pnl = ((current_price - avg_price) / avg_price) * 100
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            lines.append(
+                f"{rec_emoji} *{ticker}*  {qty:.0f} shares @ {avg_price:.2f}\n"
+                f"   Now: {current_price:.2f} | P&L: {pnl_emoji} {pnl:+.1f}%"
+            )
+        else:
+            lines.append(
+                f"{rec_emoji} *{ticker}*  {qty:.0f} shares @ {avg_price:.2f}\n"
+                f"   Current price: N/A"
+            )
+        lines.append("")
+
+    if total_invested > 0 and total_current > 0:
+        overall_pnl = ((total_current - total_invested) / total_invested) * 100
+        pnl_emoji = "🟢" if overall_pnl >= 0 else "🔴"
+        lines.append(f"💵 *Invested:* {total_invested:,.0f} EGP")
+        lines.append(f"📈 *Current:* {total_current:,.0f} EGP")
+        lines.append(f"{pnl_emoji} *Overall P&L:* {overall_pnl:+.1f}%")
+
+    return "\n".join(lines)
+
 # Cache for data
 cached_data = None
 cache_timestamp = None
@@ -438,29 +567,18 @@ def build_ask_prompt(data_csv: str, question: str, history_text: str = "", index
         if index_csv else ""
     )
     return (
-        "You are an analytical assistant for an Egyptian Exchange (EGX) stock "
-        "portfolio. Below is the latest daily technical analysis data for all "
-        "tracked stocks in CSV format.\n\n"
+        "You are a concise EGX stock analyst. Answer the user's question "
+        "directly in 2-4 sentences max. No introductions, no fluff, no "
+        "repeating the question back. Be specific with numbers.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}"
         f"{index_section}\n"
         f"QUESTION: {question}\n\n"
-        "Each stock's DATA row has an 'Index Membership' field (EGX30, EGX70, "
-        "EGX33, or UNINDEX). When discussing a stock, weigh how its own index "
-        "is moving (from the EGX INDEX SNAPSHOT, if given) alongside its "
-        "individual technicals - a stock in a rising index has extra tailwind, "
-        "one in a falling index is swimming against the current. UNINDEX just "
-        "means it isn't tracked by a major index - that's a neutral fact, not "
-        "a negative signal, so don't treat it as a strike against the stock.\n\n"
-        "Use the DATA as the source of truth for prices, recommendations, and "
-        "technical indicators - don't contradict or invent figures that differ "
-        "from it. Beyond that, be genuinely analytical: draw on your general "
-        "knowledge of markets, sector context, and macroeconomic reasoning to "
-        "give a well-rounded view, not just a restatement of the numbers. "
-        "Clearly flag which parts of your answer are backed by the data versus "
-        "general reasoning or opinion. Keep the answer suitable for a Telegram "
-        "chat message (short paragraphs or bullet points, avoid large markdown "
-        "tables)."
+        "Rules:\n"
+        "- Use DATA as source of truth; don't invent figures.\n"
+        "- Flag data-backed points vs general reasoning.\n"
+        "- Keep answer under 100 words.\n"
+        "- Telegram formatting only (bold, bullets). No tables."
     )
 
 
@@ -480,36 +598,19 @@ def build_daily_report_prompt(data_csv: str, report_history_text: str = "", sear
         if searched else ""
     )
     return (
-        "You are an analytical assistant reviewing today's EGX (Egyptian Exchange) "
-        "stock scan. Below is the full dataset in CSV format for all tracked "
-        "stocks.\n\n"
+        "You are a concise EGX stock analyst. Review today's scan and produce "
+        "a short Telegram report.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}"
         f"{index_section}\n"
-        "Task: identify the stocks with the strongest potential to increase in "
-        "price in the near term. Use the technical signals in the DATA "
-        "(Recommendation, Golden/Diamond Cross status, RSI level, volume/buy-"
-        "volume multipliers, proximity to support, risk/reward on take-profit "
-        "levels) as your primary evidence, and bring in your general market "
-        "knowledge and reasoning (sector context, typical EGX behavior, "
-        f"macro conditions) to give a genuinely analytical view.\n\n{search_line}"
-        "Each stock has an 'Index Membership' field (EGX30, EGX70, EGX33, or "
-        "UNINDEX). Cross-reference this against the EGX INDEX SNAPSHOT (if "
-        "given) - a stock in a currently rising index has an extra tailwind "
-        "worth noting; one in a falling index is worth flagging as swimming "
-        "against the tide. UNINDEX is a neutral fact, not a mark against a "
-        "stock - don't penalize it for that alone.\n\n"
-        "Produce a short report for Telegram with:\n"
-        "1. A ranked shortlist (top 5-8) of the most promising tickers, each with "
-        "a rationale that combines the technical data, its index context, and "
-        "your broader reasoning.\n"
-        "2. A brief note on any stocks flashing warning signs (e.g. Death Cross, "
-        "RSI overbought).\n"
-        "3. If prior reports are given, a short 'what changed' note (new entries "
-        "to the shortlist, stocks that dropped off, and why).\n\n"
-        "Keep the whole report under 400 words, use simple formatting (bold "
-        "ticker names, short bullets), and clearly distinguish data-backed points "
-        "from broader analysis or opinion."
+        "Task: rank the top 5-8 stocks with strongest near-term upside. "
+        "Use technical signals (Recommendation, Crosses, RSI, volume, support/"
+        f"resistance, R/R) as primary evidence.\n\n{search_line}"
+        "Format (under 200 words):\n"
+        "1. Top picks with 1-line rationale each.\n"
+        "2. Any stocks with warning signs (1 line each).\n"
+        "3. If prior reports exist: what changed (2-3 lines max).\n\n"
+        "Be direct. No introductions. Bold ticker names. Telegram formatting only."
     )
 
 
@@ -686,26 +787,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_message = f"""
 👋 *Welcome to the EGX Stock Analyzer Bot!*
 
-Hi {user.first_name}! I read your Excel analysis and provide detailed stock recommendations.
+Hi {user.first_name}! I read your Excel analysis and provide stock recommendations.
 
-📊 *Stats:* {stock_count} stocks in your portfolio
+📊 *Stats:* {stock_count} stocks tracked
 🕐 *Updated:* Daily at 5 PM Egypt Time
 
 *Commands:*
-/show TICKER - Get full analysis for a stock
-/list - Show all stocks with quick buttons
-/report - Get the latest Excel report URL
-/refresh - Reload data from GitHub
-/status - Check when data was last updated
-/indices - Show EGX30/EGX70/EGX33 index snapshot
-/ask <question> - Ask AI about any stock(s), e.g. "/ask how does COMI look?"
-/aireport - Get an AI-generated shortlist of the strongest stocks right now
-/help - Show this help
+/show TICKER - Full analysis for a stock
+/list - All stocks grouped by recommendation
+/indices - EGX30/EGX70/EGX33 snapshot
+/ask <question> - Ask AI about stocks
+/aireport - AI shortlist of strongest stocks
+/manage - Your portfolio (add holdings, get advice)
+/report - Download Excel file
+/refresh - Reload data
+/status - Cache status
+/help - Detailed help
 
-*Example:*
-/show COMI
+*Quick start:*
+/manage add COMI 100 45.50
+/manage advice
 
-📅 *Last Excel Update:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
+📅 *Last Update:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
     await update.message.reply_text(welcome_message, parse_mode="Markdown")
 
@@ -1014,6 +1117,145 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     remember_report(report)
 
+
+def build_manage_advice_prompt(data_csv: str, holdings_text: str, index_csv: str = "") -> str:
+    index_section = (
+        f"\nEGX INDEX SNAPSHOT:\n{index_csv}\n"
+        if index_csv else ""
+    )
+    return (
+        "You are a concise portfolio advisor. The user owns specific stocks. "
+        "Give brief, actionable advice (hold/buy more/sell) for EACH holding. "
+        "Be direct. No introductions.\n\n"
+        f"USER'S HOLDINGS:\n{holdings_text}\n\n"
+        f"MARKET DATA:\n{data_csv}\n"
+        f"{index_section}\n"
+        "For each holding, state in one line: action (Hold/Buy More/Sell) + "
+        "reason based on the data (recommendation, RSI, fair value, support/"
+        "resistance). If a stock looks dangerous, say so bluntly.\n"
+        "End with one overall portfolio risk note (1-2 sentences max).\n"
+        "Telegram formatting only. Under 150 words total."
+    )
+
+
+async def manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage portfolio holdings: /manage add|remove|show|clear|advice"""
+    if not context.args:
+        await update.message.reply_text(
+            "💰 *Portfolio Manager*\n\n"
+            "Usage:\n"
+            "/manage add TICKER QTY AVG_PRICE — Add/update holding\n"
+            "/manage remove TICKER — Remove a stock\n"
+            "/manage show — View portfolio with P&L\n"
+            "/manage clear — Remove all holdings\n"
+            "/manage advice — AI advice for your portfolio",
+            parse_mode="Markdown",
+        )
+        return
+
+    subcommand = context.args[0].lower()
+    chat_id = update.effective_chat.id
+
+    if subcommand == "show":
+        holdings = get_holdings(chat_id)
+        df = read_analysis_data()
+        response = format_portfolio(holdings, df)
+        await update.message.reply_text(response, parse_mode="Markdown")
+
+    elif subcommand == "clear":
+        response = clear_wallet(chat_id)
+        await update.message.reply_text(f"✅ {response}")
+
+    elif subcommand == "add":
+        if len(context.args) < 4:
+            await update.message.reply_text(
+                "Usage: /manage add TICKER QTY AVG_PRICE\n"
+                "Example: /manage add COMI 100 45.50"
+            )
+            return
+        ticker = context.args[1].upper()
+        try:
+            qty = float(context.args[2])
+            avg_price = float(context.args[3])
+        except ValueError:
+            await update.message.reply_text("❌ QTY and AVG_PRICE must be numbers.")
+            return
+        if qty <= 0 or avg_price <= 0:
+            await update.message.reply_text("❌ QTY and AVG_PRICE must be positive.")
+            return
+        result = add_holding(chat_id, ticker, qty, avg_price)
+        await update.message.reply_text(f"✅ {result}")
+
+    elif subcommand == "remove":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /manage remove TICKER")
+            return
+        ticker = context.args[1].upper()
+        result = remove_holding(chat_id, ticker)
+        await update.message.reply_text(f"✅ {result}")
+
+    elif subcommand == "advice":
+        holdings = get_holdings(chat_id)
+        if not holdings:
+            await update.message.reply_text(
+                "❌ Your portfolio is empty.\n"
+                "Use /manage add TICKER QTY AVG_PRICE to add stocks first."
+            )
+            return
+
+        if gemini_client is None:
+            await update.message.reply_text("❌ AI features disabled. Set GEMINI_API_KEY to enable.")
+            return
+
+        await update.message.reply_text("🤖 Analyzing your portfolio...")
+
+        df = read_analysis_data()
+        if df is None or df.empty:
+            await update.message.reply_text("❌ No analysis data available.")
+            return
+
+        # Build holdings text with current prices
+        holdings_lines = []
+        for ticker, info in holdings.items():
+            qty = info["qty"]
+            avg_price = info["avg_price"]
+            current_price = None
+            if df is not None:
+                row = df[df["Selected Stock"] == ticker]
+                if not row.empty:
+                    current_price = row.iloc[0].get("Current EGP Price")
+            if current_price is not None and not pd.isna(current_price):
+                pnl_pct = ((current_price - avg_price) / avg_price) * 100
+                holdings_lines.append(
+                    f"{ticker}: {qty:.0f} shares bought @ {avg_price:.2f}, "
+                    f"now {current_price:.2f} ({pnl_pct:+.1f}%)"
+                )
+            else:
+                holdings_lines.append(
+                    f"{ticker}: {qty:.0f} shares bought @ {avg_price:.2f}, current price N/A"
+                )
+        holdings_text = "\n".join(holdings_lines)
+
+        data_csv = build_compact_data_summary(df)
+        index_csv = build_index_summary()
+        prompt = build_manage_advice_prompt(data_csv, holdings_text, index_csv)
+
+        try:
+            answer = await asyncio.to_thread(call_gemini, prompt, False)
+        except Exception as e:
+            await update.message.reply_text(f"❌ AI advice failed: {e}")
+            return
+
+        header = f"💰 *Portfolio Advice* - {datetime.now().strftime('%Y-%m-%d')}\n{'=' * 30}\n\n"
+        await send_long_message(update.message.reply_text, header + answer)
+
+    else:
+        await update.message.reply_text(
+            f"❌ Unknown subcommand: {subcommand}\n"
+            "Use /manage to see available options."
+        )
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unknown commands."""
     await update.message.reply_text(
@@ -1026,50 +1268,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help_text = """
 📚 *EGX Stock Analyzer Bot - Help*
 
-*Commands:*
+*Analysis:*
+/show TICKER — Full analysis for one stock
+/list — All stocks grouped by recommendation
+/indices — EGX30/EGX70/EGX33 index snapshot
 
-/show TICKER - Get full analysis for a specific stock
-  Example: /show COMI
+*AI:*
+/ask <question> — Ask about any stock(s)
+  /ask how does COMI look?
+  /ask web: any news on SWDY? (uses live search)
+/aireport — AI shortlist of strongest stocks
+  /aireport web (with live news)
 
-/list - Show all stocks with quick buttons
-  Displays stocks grouped by recommendation
+*Portfolio:*
+/manage add TICKER QTY AVG_PRICE — Add holding
+/manage remove TICKER — Remove holding
+/manage show — View portfolio with P&L
+/manage clear — Remove all holdings
+/manage advice — AI advice for your portfolio
 
-/report - Get the latest Excel report URL
-  Sends the GitHub link to download the analysis file
+*Other:*
+/report — Download Excel file
+/refresh — Reload data from GitHub
+/status — Cache and update status
 
-/refresh - Refresh data from GitHub
-  Shows summary statistics
-
-/status - Check when data was last updated
-  Shows cache status and next update time
-
-/indices - Show EGX30/EGX70/EGX33 index snapshot
-  Close, change, RSI, and MACD status for each index
-
-/ask <question> - Ask AI about any stock(s) or the portfolio
-  Example: /ask which stocks look strongest right now?
-  Example: /ask how does COMI compare to last week?
-  Mentioning a ticker attaches its saved history and remembers this answer for next time.
-  Add 'web:' at the start to let it check live news too (small extra cost): /ask web: any recent news on COMI?
-
-/aireport - On-demand AI shortlist of the strongest stocks
-  Analyzes all tracked stocks and highlights the ones with the best
-  near-term upside, noting what changed since the last report.
-  Only runs when you call it, to keep AI usage to a minimum.
-  Add "web" to also check live news/context (small extra cost): /aireport web
-
-/help - Show this help message
-
-*Ticker Format:*
-Use the ticker symbols as they appear in your Excel file.
-Examples: COMI, CIB, EGAL, etc.
-
-*Data Source:*
-📁 GitHub: {GITHUB_RAW_URL}
+*Data:*
+📁 GitHub: {url}
 🔄 Auto-updated daily at 5 PM Egypt Time
-💾 Cached for 5 minutes to reduce API calls
+💾 Cached for 5 minutes
 """
-    await update.message.reply_text(help_text.format(GITHUB_RAW_URL=GITHUB_RAW_URL), parse_mode="Markdown")
+    await update.message.reply_text(help_text.format(url=GITHUB_RAW_URL), parse_mode="Markdown")
 
 # --------------------------------------------------------------------------
 # Main
@@ -1121,6 +1349,7 @@ def main():
     application.add_handler(CommandHandler("indices", indices_command))
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("aireport", ai_report_command))
+    application.add_handler(CommandHandler("manage", manage_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
