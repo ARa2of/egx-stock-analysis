@@ -23,7 +23,7 @@ import os
 from datetime import datetime
 import pandas as pd
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
