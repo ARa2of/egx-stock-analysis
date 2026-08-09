@@ -88,13 +88,13 @@ else:
 # Columns sent to Gemini for analysis (kept compact to minimize token usage)
 GEMINI_SUMMARY_COLUMNS = [
     "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
-    "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
     "Take Profit 1", "Take Profit 2", "Take Profit 3",
     "TP1 Risk/Reward", "TP2 Risk/Reward", "TP3 Risk/Reward",
+    "P/E Ratio (TTM)", "EPS (TTM)",
     "Recommendation Basis",
 ]
 
@@ -110,6 +110,13 @@ AI_MEMORY_PATH = os.environ.get(
 )
 MAX_HISTORY_PER_TICKER = 30   # keep last N snapshots per stock
 MAX_REPORT_HISTORY = 15       # keep last N daily reports
+
+# In-memory conversation history per user (chat_id -> list of {"role", "text"}).
+# Keeps the last MAX_CONVERSATION_HISTORY messages so the AI has context for
+# follow-up questions.  Not persisted to disk — resets on bot restart, which
+# is fine since Gemini also loses context between sessions anyway.
+MAX_CONVERSATION_HISTORY = 20  # last 10 exchanges (user + bot)
+_conversation_history: Dict[int, List[dict]] = {}
 
 
 def _load_memory() -> dict:
@@ -186,6 +193,27 @@ def format_report_history(reports: list) -> str:
     if not reports:
         return "No prior daily reports recorded."
     return "\n\n".join(f"{r.get('date')}:\n{r.get('summary')}" for r in reports)
+
+
+def add_to_conversation(chat_id: int, role: str, text: str) -> None:
+    """Append a message to the conversation history for a chat."""
+    history = _conversation_history.setdefault(chat_id, [])
+    history.append({"role": role, "text": text})
+    # Trim to the most recent messages
+    if len(history) > MAX_CONVERSATION_HISTORY:
+        _conversation_history[chat_id] = history[-MAX_CONVERSATION_HISTORY:]
+
+
+def get_conversation_history(chat_id: int) -> str:
+    """Format the recent conversation history for inclusion in a prompt."""
+    history = _conversation_history.get(chat_id, [])
+    if not history:
+        return ""
+    lines = ["Recent conversation (for context — continue naturally):"]
+    for msg in history:
+        label = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"{label}: {msg['text'][:300]}")
+    return "\n".join(lines)
 
 
 def find_mentioned_tickers(question: str, df: pd.DataFrame) -> list:
@@ -567,7 +595,8 @@ def build_index_summary() -> str:
     return df.to_csv(index=False)
 
 
-def build_ask_prompt(data_csv: str, question: str, history_text: str = "", index_csv: str = "") -> str:
+def build_ask_prompt(data_csv: str, question: str, history_text: str = "",
+                     index_csv: str = "", conversation: str = "") -> str:
     history_section = (
         f"\nPRIOR HISTORY FOR STOCKS MENTIONED IN THE QUESTION:\n{history_text}\n"
         if history_text else ""
@@ -576,20 +605,30 @@ def build_ask_prompt(data_csv: str, question: str, history_text: str = "", index
         f"\nEGX INDEX SNAPSHOT (EGX30/EGX70/EGX33):\n{index_csv}\n"
         if index_csv else ""
     )
+    conv_section = (
+        f"\n{conversation}\n"
+        if conversation else ""
+    )
     return (
-        "You are a concise EGX stock analyst. Answer the user's question "
-        "directly in 2-4 sentences max. No introductions, no fluff, no "
-        "repeating the question back. Be specific with numbers.\n\n"
+        "You are an experienced EGX stock analyst and trading advisor. "
+        "Blend the provided data with your general market knowledge to give "
+        "actionable, thoughtful advice. Don't just recite numbers — interpret "
+        "them, explain what they mean, and give your honest opinion.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}"
-        f"{index_section}\n"
+        f"{index_section}"
+        f"{conv_section}\n"
         f"QUESTION: {question}\n\n"
         "Rules:\n"
-        "- Use DATA as source of truth; don't invent figures.\n"
-        "- Compare today vs prior days from HISTORY. Note trends: improving/declining RSI, "
-        "momentum shifts, recommendation changes (e.g. 'Buy 3 days ago → Hold today').\n"
-        "- Flag data-backed points vs general reasoning.\n"
-        "- Keep answer under 150 words.\n"
+        "- Use the DATA for specific numbers and facts. Don't invent figures.\n"
+        "- IGNORE Fair Value, Implied Fair Value, Undervalued, or Fair Value Method columns.\n"
+        "- Blend data with your general knowledge about trading, technical analysis, "
+        "risk management, and market behaviour. Share your opinion.\n"
+        "- If the user asks what to do (hold/buy/sell), give a clear recommendation "
+        "with reasoning — don't hedge with 'it depends'.\n"
+        "- If this is a follow-up question, continue the conversation naturally "
+        "from the history above.\n"
+        "- Be direct, honest, and practical. Max 200 words.\n"
         "- Telegram formatting only (bold, bullets). No tables."
     )
 
@@ -614,18 +653,25 @@ def build_daily_report_prompt(data_csv: str, report_history_text: str = "", sear
         if searched else ""
     )
     return (
-        "You are a concise EGX stock analyst. Review today's scan and produce "
-        "a short Telegram report.\n\n"
+        "You are an experienced EGX stock analyst. Review today's scan and produce "
+        "a short Telegram report. Blend the data with your general market knowledge "
+        "to give insightful, actionable commentary — not just numbers.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}"
         f"{ticker_hist_section}"
         f"{index_section}\n"
         "Task: rank the top 5-8 stocks with strongest near-term upside. "
         "Use technical signals (Recommendation, Crosses, RSI, volume, support/"
-        f"resistance, R/R) as primary evidence.\n\n{search_line}"
+        f"resistance, R/R, P/E, EPS) as primary evidence.\n\n{search_line}"
         "IMPORTANT: Compare today's values to prior days in the PRICE HISTORY. "
         "Note trends: is RSI improving or declining? Is the stock moving from "
         "Buy→Hold or Hold→Buy? Are volume and momentum building or fading?\n\n"
+        "IGNORE Fair Value, Implied Fair Value, Undervalued, or Fair Value Method "
+        "columns. Do NOT base recommendations on these. Focus on: "
+        "historical trends, technical indicators (RSI, MACD, crosses, volume, "
+        "support/resistance), and actual fundamentals (P/E, EPS).\n\n"
+        "Use your general knowledge about market dynamics, sector rotation, "
+        "risk management, and trading psychology to add context.\n\n"
         "Format (under 250 words):\n"
         "1. Top picks with 1-line rationale each.\n"
         "2. Any stocks with warning signs (1 line each).\n"
@@ -817,6 +863,7 @@ Hi {user.first_name}! I read your Excel analysis and provide stock recommendatio
 /list - All stocks grouped by recommendation
 /indices - EGX30/EGX70/EGX33 snapshot
 /swing TICKER - Detected swing range for a stock
+/listSw - All swing opportunities ranked
 /ask <question> - Ask AI about stocks
 /aireport - AI shortlist of strongest stocks
 /manage - Your portfolio (add holdings, get advice)
@@ -1086,7 +1133,14 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             history_text = "HISTORY (top-rated stocks, last 15 days):\n\n" + "\n\n".join(parts)
 
     data_csv = build_compact_data_summary(df)
-    prompt = build_ask_prompt(data_csv, question, history_text, index_csv=build_index_summary())
+    chat_id = update.effective_chat.id
+    # Save user message and get conversation history
+    add_to_conversation(chat_id, "user", question)
+    conversation = get_conversation_history(chat_id)
+
+    prompt = build_ask_prompt(data_csv, question, history_text,
+                              index_csv=build_index_summary(),
+                              conversation=conversation)
 
     try:
         answer = await asyncio.to_thread(call_gemini, prompt, use_search)
@@ -1096,6 +1150,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await send_long_message(update.message.reply_text, answer)
+
+    # Save AI response to conversation history
+    add_to_conversation(chat_id, "assistant", answer)
 
     # Save a fresh snapshot for any ticker discussed, so a future question
     # about it has real history (price/rec/RSI + a slice of this answer).
@@ -1177,19 +1234,24 @@ def build_manage_advice_prompt(data_csv: str, holdings_text: str, index_csv: str
         if ticker_history else ""
     )
     return (
-        "You are a concise portfolio advisor. The user owns specific stocks. "
+        "You are an experienced portfolio advisor. The user owns specific stocks. "
         "Give brief, actionable advice (hold/buy more/sell) for EACH holding. "
-        "Be direct. No introductions.\n\n"
+        "Blend the data with your general knowledge about risk management, "
+        "position sizing, and market dynamics. Be direct. No introductions.\n\n"
         f"USER'S HOLDINGS:\n{holdings_text}\n\n"
         f"MARKET DATA:\n{data_csv}\n"
         f"{history_section}"
         f"{index_section}\n"
-        "For each holding, state in one line: action (Hold/Buy More/Sell) + "
-        "reason based on the data (recommendation, RSI, fair value, support/"
-        "resistance). Compare today vs prior days from the HISTORY section - "
+        "IGNORE Fair Value, Implied Fair Value, Undervalued, or Fair Value Method "
+        "columns. Do NOT base advice on these.\n"
+        "For each holding, state: action (Hold/Buy More/Sell) + "
+        "reason based on technical indicators (recommendation, RSI, crosses, "
+        "volume, support/resistance, R/R) and fundamentals (P/E, EPS). "
+        "Add your own assessment of risk and positioning.\n"
+        "Compare today vs prior days from the HISTORY section - "
         "note if momentum is improving or declining.\n"
-        "End with one overall portfolio risk note (1-2 sentences max).\n"
-        "Telegram formatting only. Under 150 words total."
+        "End with one overall portfolio risk note and any suggested rebalancing.\n"
+        "Telegram formatting only. Under 200 words total."
     )
 
 
@@ -1332,48 +1394,97 @@ async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     df = read_swing_data()
     if df is None or df.empty:
-        await update.message.reply_text("❌ Swing ranges not available yet. Run the analysis first.")
+        await update.message.reply_text(
+            "❌ Swing ranges not available yet.\n"
+            "Run the analysis first (python egx_stock_analysis.py), "
+            "then push the Excel to GitHub."
+        )
         return
 
     # Filter by ticker
-    if "Ticker" in df.columns:
-        tdf = df[df["Ticker"].str.upper() == ticker]
-    elif "Selected Stock" in df.columns:
-        tdf = df[df["Selected Stock"].str.upper() == ticker]
-    else:
-        await update.message.reply_text("❌ Unexpected swing data format.")
-        return
-
+    tdf = df[df["Ticker"].str.upper() == ticker]
     if tdf.empty:
-        await update.message.reply_text(f"❌ No swing data found for {ticker}.")
+        # Show available tickers so user knows what exists
+        available = ", ".join(df["Ticker"].head(20).tolist())
+        await update.message.reply_text(
+            f"❌ No swing data for {ticker}.\n"
+            f"Available: {available}"
+        )
         return
 
-    lines = [f"📈 *{ticker} Swing Ranges*\n"]
-    for _, row in tdf.iterrows():
-        method = row.get("Method", "")
-        support = row.get("Support Level", "")
-        resistance = row.get("Resistance Level", "")
-        low = row.get("Recent Low", "")
-        high = row.get("Recent High", "")
-        date_low = row.get("Low Date", "")
-        date_high = row.get("High Date", "")
+    row = tdf.iloc[0]
 
-        entry = f"*{method}*"
-        if support and not (isinstance(support, float) and pd.isna(support)):
-            entry += f"\n  Support: {support:.2f}" if isinstance(support, (int, float)) else f"\n  Support: {support}"
-        if resistance and not (isinstance(resistance, float) and pd.isna(resistance)):
-            entry += f"\n  Resistance: {resistance:.2f}" if isinstance(resistance, (int, float)) else f"\n  Resistance: {resistance}"
-        if low and not (isinstance(low, float) and pd.isna(low)):
-            entry += f"\n  Recent Low: {low:.2f}" if isinstance(low, (int, float)) else f"\n  Recent Low: {low}"
-        if high and not (isinstance(high, float) and pd.isna(high)):
-            entry += f"\n  Recent High: {high:.2f}" if isinstance(high, (int, float)) else f"\n  Recent High: {high}"
-        if date_low and not (isinstance(date_low, float) and pd.isna(date_low)):
-            entry += f"\n  Low Date: {date_low}"
-        if date_high and not (isinstance(date_high, float) and pd.isna(date_high)):
-            entry += f"\n  High Date: {date_high}"
-        lines.append(entry)
+    def safe(val, fmt=".2f"):
+        if pd.isna(val):
+            return "N/A"
+        return f"{val:{fmt}}" if isinstance(val, (int, float)) else str(val)
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    score = safe(row.get("Swing Score"), ".0f")
+    pos = safe(row.get("Position in Range (%)"), ".0f")
+    stability = safe(row.get("Range Stability"), ".0f")
+
+    text = (
+        f"📈 *{ticker} Swing Analysis*\n"
+        f"{'=' * 28}\n\n"
+        f"*Current Price:* {safe(row.get('Current Price'))}\n\n"
+        f"*Range Levels:*\n"
+        f"  Support (Low): {safe(row.get('Range Low'))}\n"
+        f"  Mid: {safe(row.get('Range Mid'))}\n"
+        f"  Resistance (High): {safe(row.get('Range High'))}\n"
+        f"  Width: {safe(row.get('Range Width (%)'))}%\n\n"
+        f"*Testing & Stability:*\n"
+        f"  Support Tests: {safe(row.get('Support Tests'), '.0f')}\n"
+        f"  Resistance Tests: {safe(row.get('Resistance Tests'), '.0f')}\n"
+        f"  Completed Cycles: {safe(row.get('Range Cycles'), '.0f')}\n"
+        f"  Stability: {stability}/100\n\n"
+        f"*Position & Potential:*\n"
+        f"  Position in Range: {pos}%\n"
+        f"  Distance to Low: {safe(row.get('Distance to Low (%)'))}%\n"
+        f"  Distance to High: {safe(row.get('Distance to High (%)'))}%\n\n"
+        f"*Trade Setup:*\n"
+        f"  Entry: {safe(row.get('Swing Entry'))}\n"
+        f"  Target: {safe(row.get('Swing Target'))}\n"
+        f"  Stop Loss: {safe(row.get('Stop Loss'))}\n\n"
+        f"*Swing Score:* {score}/100"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def listsw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all swing opportunities ranked by Swing Score."""
+    df = read_swing_data()
+    if df is None or df.empty:
+        await update.message.reply_text(
+            "❌ Swing ranges not available yet.\n"
+            "Run the analysis first (python egx_stock_analysis.py), "
+            "then push the Excel to GitHub."
+        )
+        return
+
+    df = df.sort_values("Swing Score", ascending=False).reset_index(drop=True)
+
+    lines = ["📈 *EGX Swing Opportunities*\n"]
+
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        ticker = row.get("Ticker", "?")
+        score = row.get("Swing Score", 0)
+        low = row.get("Range Low", 0)
+        high = row.get("Range High", 0)
+        current = row.get("Current Price", 0)
+        pos = row.get("Position in Range (%)", 0)
+
+        def safe(v, fmt=".2f"):
+            if pd.isna(v):
+                return "N/A"
+            return f"{v:{fmt}}" if isinstance(v, (int, float)) else str(v)
+
+        lines.append(
+            f"{i}. *{ticker}* — Score: {safe(score, '.0f')} — "
+            f"Range: {safe(low)}–{safe(high)} — Current: {safe(current)} — "
+            f"Pos: {safe(pos, '.0f')}%"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1385,40 +1496,36 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help message."""
-    help_text = """
-📚 *EGX Stock Analyzer Bot - Help*
-
-*Analysis:*
-/show TICKER — Full analysis for one stock
-/list — All stocks grouped by recommendation
-/indices — EGX30/EGX70/EGX33 index snapshot
-/swing TICKER — Detected swing range (support/resistance)
-
-*AI:*
-/ask <question> — Ask about any stock(s)
-  /ask how does COMI look?
-  /ask web: any news on SWDY? (uses live search)
-/aireport — AI shortlist of strongest stocks
-  /aireport web (with live news)
-
-*Portfolio:*
-/manage add TICKER QTY AVG_PRICE — Add holding
-/manage remove TICKER — Remove holding
-/manage show — View portfolio with P&L
-/manage clear — Remove all holdings
-/manage advice — AI advice for your portfolio
-
-*Other:*
-/report — Download Excel file
-/refresh — Reload data from GitHub
-/status — Cache and update status
-
-*Data:*
-📁 GitHub: {url}
-🔄 Auto-updated daily at 5 PM Egypt Time
-💾 Cached for 5 minutes
-"""
-    await update.message.reply_text(help_text.format(url=GITHUB_RAW_URL), parse_mode="Markdown")
+    help_text = (
+        "📚 <b>EGX Stock Analyzer Bot - Help</b>\n\n"
+        "<b>Analysis:</b>\n"
+        "/show TICKER — Full analysis for one stock\n"
+        "/list — All stocks grouped by recommendation\n"
+        "/indices — EGX30/EGX70/EGX33 index snapshot\n"
+        "/swing TICKER — Detected swing range (support/resistance)\n"
+        "/listSw — All swing opportunities ranked by score\n\n"
+        "<b>AI:</b>\n"
+        "/ask &lt;question&gt; — Ask about any stock(s)\n"
+        "  /ask how does COMI look?\n"
+        "  /ask web: any news on SWDY? (uses live search)\n"
+        "/aireport — AI shortlist of strongest stocks\n"
+        "  /aireport web (with live news)\n\n"
+        "<b>Portfolio:</b>\n"
+        "/manage add TICKER QTY AVG_PRICE — Add holding\n"
+        "/manage remove TICKER — Remove holding\n"
+        "/manage show — View portfolio with P&amp;L\n"
+        "/manage clear — Remove all holdings\n"
+        "/manage advice — AI advice for your portfolio\n\n"
+        "<b>Other:</b>\n"
+        "/report — Download Excel file\n"
+        "/refresh — Reload data from GitHub\n"
+        "/status — Cache and update status\n\n"
+        f"<b>Data:</b>\n"
+        f"📁 GitHub: {GITHUB_RAW_URL}\n"
+        "🔄 Auto-updated daily at 5 PM Egypt Time\n"
+        "💾 Cached for 5 minutes"
+    )
+    await update.message.reply_text(help_text, parse_mode="HTML")
 
 # --------------------------------------------------------------------------
 # Main
@@ -1472,6 +1579,7 @@ def main():
     application.add_handler(CommandHandler("aireport", ai_report_command))
     application.add_handler(CommandHandler("manage", manage_command))
     application.add_handler(CommandHandler("swing", swing_command))
+    application.add_handler(CommandHandler("listSw", listsw_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
