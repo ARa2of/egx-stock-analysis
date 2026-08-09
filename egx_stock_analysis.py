@@ -776,46 +776,6 @@ SWING_RANGE_MAX_WIDTH_PCT = 30  # maximum range width (% of mid)
 SWING_RANGE_MIN_CROSSINGS = 2   # minimum midline crossings
 
 
-def _find_fractal_extrema(highs: np.ndarray, lows: np.ndarray, order: int = 2) -> Tuple[List[float], List[float]]:
-    """Find fractal swing highs and lows.
-
-    A fractal high at index i requires highs[i] to be the maximum in
-    the window [i-order, i+order].  Same logic for fractal lows using
-    lows[].  Returns two lists: fractal_highs, fractal_lows (price values).
-    """
-    fractal_highs: List[float] = []
-    fractal_lows: List[float] = []
-    n = len(highs)
-    for i in range(order, n - order):
-        h_window = highs[i - order: i + order + 1]
-        l_window = lows[i - order: i + order + 1]
-        if highs[i] == h_window.max():
-            fractal_highs.append(float(highs[i]))
-        if lows[i] == l_window.min():
-            fractal_lows.append(float(lows[i]))
-    return fractal_highs, fractal_lows
-
-
-def _find_rolling_extrema(close: np.ndarray, highs: np.ndarray, lows: np.ndarray,
-                          window: int) -> Tuple[List[float], List[float]]:
-    """Find rolling-window min/max levels.
-
-    For each position, record the rolling min of lows (support) and
-    rolling max of highs (resistance) at window boundaries.  This captures
-    levels that fractal detection with a small order might miss.
-    """
-    rolling_supports: List[float] = []
-    rolling_resistance: List[float] = []
-    n = len(close)
-    if n < window:
-        return rolling_supports, rolling_resistance
-    for i in range(window - 1, n):
-        start = i - window + 1
-        rolling_supports.append(float(lows[start: i + 1].min()))
-        rolling_resistance.append(float(highs[start: i + 1].max()))
-    return rolling_supports, rolling_resistance
-
-
 def _compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
                  period: int = 14) -> float:
     """Compute Average True Range over the last `period` bars."""
@@ -831,23 +791,14 @@ def _compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
         trs.append(tr)
     if not trs:
         return 0.0
-    arr = np.array(trs[-period:])
-    return float(arr.mean())
+    return float(np.array(trs[-period:]).mean())
 
 
-def _cluster_levels(levels: List[float], atr: float) -> List[Tuple[float, int]]:
-    """Cluster nearby price levels using ATR-based distance.
-
-    Two levels are considered the same zone if they are within 0.5 * ATR
-    of each other (or 2% of the mean, whichever is larger).  Returns
-    list of (mean_price, count) sorted by count descending.
-    """
+def _cluster_levels(levels: List[float], tol: float) -> List[Tuple[float, int]]:
+    """Cluster nearby price levels. Returns (mean, count) sorted by count."""
     if not levels:
         return []
     levels = sorted(levels)
-    mean_price = np.mean(levels)
-    # Use ATR-based tolerance, with a 2% floor
-    tol = max(atr * 0.5, mean_price * SWING_RANGE_CLUSTER_TOL)
     clusters: List[List[float]] = [[levels[0]]]
     for lv in levels[1:]:
         if abs(lv - clusters[-1][-1]) <= tol:
@@ -873,18 +824,88 @@ def _count_midline_crossings(close: np.ndarray, midline: float,
     return crossings
 
 
+def _find_cluster_method_levels(close: np.ndarray) -> Tuple[List[float], List[float]]:
+    """Method A: Original cluster approach — find local minima/maxima on
+    Close prices using a sliding window, requiring multiple retests."""
+    supports: List[float] = []
+    resistance: List[float] = []
+    order = 2
+    if len(close) < 2 * order + 1:
+        return supports, resistance
+    for i in range(order, len(close) - order):
+        window = close[i - order: i + order + 1]
+        if close[i] == window.min():
+            supports.append(float(close[i]))
+        if close[i] == window.max():
+            resistance.append(float(close[i]))
+    return supports, resistance
+
+
+def _find_fractal_levels(highs: np.ndarray, lows: np.ndarray,
+                         order: int = 2) -> Tuple[List[float], List[float]]:
+    """Method B: Fractal highs/lows on actual High/Low arrays."""
+    fractal_highs: List[float] = []
+    fractal_lows: List[float] = []
+    n = len(highs)
+    for i in range(order, n - order):
+        if highs[i] == highs[i - order: i + order + 1].max():
+            fractal_highs.append(float(highs[i]))
+        if lows[i] == lows[i - order: i + order + 1].min():
+            fractal_lows.append(float(lows[i]))
+    return fractal_highs, fractal_lows
+
+
+def _find_rolling_levels(close: np.ndarray, highs: np.ndarray,
+                         lows: np.ndarray) -> Tuple[List[float], List[float]]:
+    """Method C: Rolling window min/max at multiple timeframes."""
+    supports: List[float] = []
+    resistance: List[float] = []
+    n = len(close)
+    for window in [10, 15, SWING_RANGE_LOOKBACK]:
+        if n < window:
+            continue
+        # Record the min of lows and max of highs for each rolling position
+        for i in range(window - 1, n):
+            start = i - window + 1
+            supports.append(float(lows[start: i + 1].min()))
+            resistance.append(float(highs[start: i + 1].max()))
+    return supports, resistance
+
+
+def _find_weighted_levels(close: np.ndarray) -> Tuple[List[float], List[float]]:
+    """Method D: Weighted local extrema (recent 5 days weighted 2x)."""
+    supports: List[float] = []
+    resistance: List[float] = []
+    recent = close[-SWING_RANGE_RECENT:]
+    older = close[-SWING_RANGE_LOOKBACK:-SWING_RANGE_RECENT]
+    weighted = np.concatenate([older, recent, recent])
+    order = 2
+    if len(weighted) < 2 * order + 1:
+        return supports, resistance
+    for i in range(order, len(weighted) - order):
+        w = weighted[i - order: i + order + 1]
+        if weighted[i] == w.max():
+            resistance.append(float(weighted[i]))
+        if weighted[i] == w.min():
+            supports.append(float(weighted[i]))
+    return supports, resistance
+
+
 def detect_swing_range(yf_cache: Dict[str, TickerData],
                        ta_cache: Optional[Dict[str, "TickerTA"]] = None) -> pd.DataFrame:
     """Detect stocks that oscillate within a well-defined price range.
 
-    Hybrid approach combining:
-      1. Fractal highs/lows on actual High/Low arrays
-      2. Rolling-window min/max across multiple timeframes (10, 15, 20 days)
-      3. ATR-based level separation and filtering
-      4. Multi-timeframe confirmation (levels appearing in 2+ windows score higher)
+    Combined approach running 4 independent detection methods, then
+    merging and clustering all candidate levels:
 
-    Uses TradingView close price for the current price when available
-    (yfinance close can lag by 1 day).
+      A. Cluster method: local minima/maxima on Close prices
+      B. Fractal method: fractal highs/lows on High/Low arrays
+      C. Rolling method: rolling min/max across 10/15/20-day windows
+      D. Weighted method: recent days weighted 2x for local extrema
+
+    Levels confirmed by multiple methods get higher scores.  Uses
+    ATR-based clustering to merge nearby levels and TradingView close
+    for the current price (fresher than yfinance).
     """
     if ta_cache is None:
         ta_cache = {}
@@ -906,60 +927,75 @@ def detect_swing_range(yf_cache: Dict[str, TickerData],
         if atr <= 0:
             continue
 
-        # ── Collect candidate support/resistance levels ──────────────
-        all_supports: List[float] = []
-        all_resistance: List[float] = []
-
-        # Method 1: Fractal highs/lows (order=2)
-        fractal_highs, fractal_lows = _find_fractal_extrema(highs, lows, order=2)
-        all_supports.extend(fractal_lows)
-        all_resistance.extend(fractal_highs)
-
-        # Method 2: Rolling windows at multiple timeframes
-        for window in [10, 15, SWING_RANGE_LOOKBACK]:
-            r_sup, r_res = _find_rolling_extrema(close, highs, lows, window)
-            # Take only the boundary values (min/max per window)
-            if r_sup:
-                all_supports.append(min(r_sup))
-            if r_res:
-                all_resistance.append(max(r_res))
-
-        # Method 3: Recent weighted local extrema
-        recent_close = close[-SWING_RANGE_RECENT:]
-        older_close = close[-SWING_RANGE_LOOKBACK:-SWING_RANGE_RECENT]
-        weighted = np.concatenate([older_close, recent_close, recent_close])
-        sw_order = 2
-        if len(weighted) >= 2 * sw_order + 1:
-            for i in range(sw_order, len(weighted) - sw_order):
-                w = weighted[i - sw_order: i + sw_order + 1]
-                if weighted[i] == w.max():
-                    all_resistance.append(float(weighted[i]))
-                if weighted[i] == w.min():
-                    all_supports.append(float(weighted[i]))
-
-        # Remove self-matches and outliers (> 3 ATR from median)
         median_price = float(np.median(close))
-        all_supports = [s for s in all_supports if abs(s - median_price) < 3 * atr]
-        all_resistance = [r for r in all_resistance if abs(r - median_price) < 3 * atr]
+        tol = max(atr * 0.5, median_price * SWING_RANGE_CLUSTER_TOL)
+
+        # ── Run all 4 detection methods ──────────────────────────────
+        # Each method returns (supports, resistance) as lists of prices
+        sup_a, res_a = _find_cluster_method_levels(close)
+        sup_b, res_b = _find_fractal_levels(highs, lows, order=2)
+        sup_c, res_c = _find_rolling_levels(close, highs, lows)
+        sup_d, res_d = _find_weighted_levels(close)
+
+        # Tag each level with which methods found it (for scoring later)
+        all_supports: List[Tuple[float, int]] = []  # (price, method_bitmask)
+        all_resistance: List[Tuple[float, int]] = []
+
+        def _add_levels(target: List[Tuple[float, int]], levels: List[float], bit: int):
+            for lv in levels:
+                # Filter outliers (> 3 ATR from median)
+                if abs(lv - median_price) < 3 * atr:
+                    target.append((lv, bit))
+
+        _add_levels(all_supports, sup_a, 1)
+        _add_levels(all_supports, sup_b, 2)
+        _add_levels(all_supports, sup_c, 4)
+        _add_levels(all_supports, sup_d, 8)
+        _add_levels(all_resistance, res_a, 1)
+        _add_levels(all_resistance, res_b, 2)
+        _add_levels(all_resistance, res_c, 4)
+        _add_levels(all_resistance, res_d, 8)
 
         if len(all_supports) < 2 or len(all_resistance) < 2:
             continue
 
-        # ── Cluster and confirm levels ───────────────────────────────
-        support_clusters = _cluster_levels(all_supports, atr)
-        resistance_clusters = _cluster_levels(all_resistance, atr)
+        # ── Cluster combined levels ──────────────────────────────────
+        def _cluster_tagged(tagged: List[Tuple[float, int]]) -> List[Tuple[float, int, int]]:
+            """Cluster tagged levels, preserving method bitmask OR-d across members."""
+            if not tagged:
+                return []
+            tagged.sort(key=lambda x: x[0])
+            clusters: List[List[Tuple[float, int]]] = [[tagged[0]]]
+            for lv, bit in tagged[1:]:
+                if abs(lv - clusters[-1][-1][0]) <= tol:
+                    clusters[-1].append((lv, bit))
+                else:
+                    clusters.append([(lv, bit)])
+            result = []
+            for c in clusters:
+                mean_price = float(np.mean([x[0] for x in c]))
+                combined_bit = 0
+                for _, b in c:
+                    combined_bit |= b
+                result.append((mean_price, len(c), combined_bit))
+            result.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            return result
 
-        confirmed_supports = [(avg, cnt) for avg, cnt in support_clusters
+        sup_clusters = _cluster_tagged(all_supports)
+        res_clusters = _cluster_tagged(all_resistance)
+
+        # Filter: require minimum tests
+        confirmed_supports = [(avg, cnt, bits) for avg, cnt, bits in sup_clusters
                               if cnt >= SWING_RANGE_MIN_TESTS]
-        confirmed_resistance = [(avg, cnt) for avg, cnt in resistance_clusters
+        confirmed_resistance = [(avg, cnt, bits) for avg, cnt, bits in res_clusters
                                 if cnt >= SWING_RANGE_MIN_TESTS]
 
         if not confirmed_supports or not confirmed_resistance:
             continue
 
-        # Pick the strongest support and resistance
-        best_support, support_tests = confirmed_supports[0]
-        best_resistance, resistance_tests = confirmed_resistance[0]
+        # Pick the strongest support and resistance (most tests, then most method agreement)
+        best_support, support_tests, sup_bits = confirmed_supports[0]
+        best_resistance, resistance_tests, res_bits = confirmed_resistance[0]
 
         if best_resistance <= best_support:
             continue
@@ -987,19 +1023,13 @@ def detect_swing_range(yf_cache: Dict[str, TickerData],
         if crossings < SWING_RANGE_MIN_CROSSINGS:
             continue
 
-        # ── Multi-timeframe confirmation ─────────────────────────────
-        # Check if support/resistance also appear in shorter windows
-        tf_support = 0
-        tf_resistance = 0
-        for window in [10, 15, SWING_RANGE_LOOKBACK]:
-            if len(close) >= window:
-                w_close = close[-window:]
-                w_sup = float(w_close.min())
-                w_res = float(w_close.max())
-                if abs(w_sup - best_support) <= atr:
-                    tf_support += 1
-                if abs(w_res - best_resistance) <= atr:
-                    tf_resistance += 1
+        # ── Method agreement bonus ───────────────────────────────────
+        # Count how many of the 4 methods contributed to the confirmed levels
+        def _method_count(bitmask: int) -> int:
+            return bin(bitmask).count("1")
+
+        sup_method_count = _method_count(sup_bits)
+        res_method_count = _method_count(res_bits)
 
         # ── Position and distances ───────────────────────────────────
         position_in_range = ((current_price - best_support) / range_width) * 100
@@ -1009,25 +1039,26 @@ def detect_swing_range(yf_cache: Dict[str, TickerData],
         distance_to_high = ((best_resistance - current_price) / current_price) * 100 if current_price > 0 else 0
 
         # ── Scoring ──────────────────────────────────────────────────
-        # Stability: penalise very wide ranges, reward multi-tf confirmation
-        stability = min(100, (crossings * 12) + (support_tests * 8) + (resistance_tests * 8)
-                        + (tf_support * 10) + (tf_resistance * 10))
+        # Stability: penalise very wide ranges
+        stability = min(100, (crossings * 12)
+                        + (support_tests * 8) + (resistance_tests * 8)
+                        + (sup_method_count * 10) + (res_method_count * 10))
         if range_width_pct > 15:
             stability = int(stability * 0.7)
 
         # Swing entry/target/stop
-        swing_entry = best_support * 1.005   # slightly above support
-        swing_target = range_mid              # target mid-range
-        stop_loss = best_support * 0.97       # 3% below support
+        swing_entry = best_support * 1.005
+        swing_target = range_mid
+        stop_loss = best_support * 0.97
 
-        # Combined score
+        # Combined score: stability, crossings, tests, method agreement
         swing_score = int(
-            (stability * 0.35)
-            + (crossings * 12)
+            (stability * 0.30)
+            + (crossings * 10)
             + (min(support_tests, 5) * 5)
             + (min(resistance_tests, 5) * 5)
-            + (tf_support * 8)
-            + (tf_resistance * 8)
+            + (sup_method_count * 10)
+            + (res_method_count * 10)
         )
 
         results.append({
