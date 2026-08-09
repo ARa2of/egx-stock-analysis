@@ -1426,6 +1426,10 @@ async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = (
         f"📈 *{ticker} Swing Analysis*\n"
         f"{'=' * 28}\n\n"
+        f"*Classification:* {safe(row.get('Classification'))}\n"
+        f"*Suitability:* {safe(row.get('Suitability'), '.0f')}/100\n"
+        f"*Hurst:* {safe(row.get('Hurst'), '.3f')}\n"
+        f"*Typical Cycle:* {safe(row.get('Cycle Period (days)'), '.0f')} days\n\n"
         f"*Current Price:* {safe(row.get('Current Price'))}\n\n"
         f"*Range Levels:*\n"
         f"  Support (Low): {safe(row.get('Range Low'))}\n"
@@ -1479,7 +1483,8 @@ async def listsw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return f"{v:{fmt}}" if isinstance(v, (int, float)) else str(v)
 
         lines.append(
-            f"{i}. *{ticker}* — Score: {safe(score, '.0f')} — "
+            f"{i}. *{ticker}* — {safe(row.get('Classification'))} — "
+            f"Score: {safe(score, '.0f')} — "
             f"Range: {safe(low)}–{safe(high)} — Current: {safe(current)} — "
             f"Pos: {safe(pos, '.0f')}%"
         )
