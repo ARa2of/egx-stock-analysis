@@ -764,6 +764,169 @@ def support_resistance(raw_ticker: str, yf_cache: Dict[str, TickerData]) -> dict
 
 
 # --------------------------------------------------------------------------
+# Swing Range Detection
+# --------------------------------------------------------------------------
+
+SWING_RANGE_LOOKBACK = 15       # 3 weeks of trading days
+SWING_RANGE_RECENT = 5          # last 1 week, weighted 2x
+SWING_RANGE_CLUSTER_TOL = 0.02  # 2% tolerance for clustering price levels
+SWING_RANGE_MIN_TESTS = 2       # minimum retests to confirm a level
+
+
+def detect_swing_range(yf_cache: Dict[str, TickerData]) -> pd.DataFrame:
+    """
+    Detect stocks that oscillate within a well-defined price range.
+
+    Analyses the last 15 trading days (3 weeks), with the last 5 days
+    weighted 2x.  Clusters local minima/maxima to find repeated
+    support/resistance zones.  Requires at least 2 retests to confirm
+    a level.  Returns a DataFrame with one row per stock that exhibits
+    range-bound behaviour.
+    """
+    results = []
+
+    for raw_ticker, entry in yf_cache.items():
+        if entry is None or not entry.ok:
+            continue
+
+        hist = entry.history.tail(SWING_RANGE_LOOKBACK + 10)  # extra buffer
+        if len(hist) < SWING_RANGE_LOOKBACK:
+            continue
+
+        close = hist["Close"].values
+        high = hist["High"].values if "High" in hist.columns else close
+        low = hist["Low"].values if "Low" in hist.columns else close
+
+        # Recent window (last 5 days) and older window
+        recent_close = close[-SWING_RANGE_RECENT:]
+        older_close = close[-SWING_RANGE_LOOKBACK:-SWING_RANGE_RECENT]
+
+        # Build weighted price array (recent days count 2x)
+        weighted_prices = np.concatenate([older_close, recent_close, recent_close])
+
+        # Find local minima and maxima using small order for 3-week data
+        swing_order = 2
+        if len(weighted_prices) < (2 * swing_order + 1):
+            continue
+
+        local_maxs = []
+        local_mins = []
+        for i in range(swing_order, len(weighted_prices) - swing_order):
+            window = weighted_prices[i - swing_order: i + swing_order + 1]
+            if weighted_prices[i] == window.max():
+                local_maxs.append(weighted_prices[i])
+            if weighted_prices[i] == window.min():
+                local_mins.append(weighted_prices[i])
+
+        if len(local_mins) < 2 or len(local_maxs) < 2:
+            continue
+
+        # Cluster nearby price levels (within tolerance)
+        def cluster_levels(levels, tol_pct):
+            if not levels:
+                return []
+            levels = sorted(levels)
+            clusters = [[levels[0]]]
+            for lv in levels[1:]:
+                if abs(lv - clusters[-1][-1]) / clusters[-1][-1] <= tol_pct:
+                    clusters[-1].append(lv)
+                else:
+                    clusters.append([lv])
+            return [(np.mean(c), len(c)) for c in clusters]
+
+        tolerance = np.mean(weighted_prices) * SWING_RANGE_CLUSTER_TOL
+        tol_pct = tolerance / np.mean(weighted_prices)
+
+        support_clusters = cluster_levels(local_mins, tol_pct)
+        resistance_clusters = cluster_levels(local_maxs, tol_pct)
+
+        # Filter: require minimum tests
+        confirmed_supports = [(avg, cnt) for avg, cnt in support_clusters if cnt >= SWING_RANGE_MIN_TESTS]
+        confirmed_resistance = [(avg, cnt) for avg, cnt in resistance_clusters if cnt >= SWING_RANGE_MIN_TESTS]
+
+        if not confirmed_supports or not confirmed_resistance:
+            continue
+
+        # Pick the strongest support (most tests) and strongest resistance
+        best_support, support_tests = max(confirmed_supports, key=lambda x: x[1])
+        best_resistance, resistance_tests = max(confirmed_resistance, key=lambda x: x[1])
+
+        # Only accept if resistance > support
+        if best_resistance <= best_support:
+            continue
+
+        current_price = float(close[-1])
+        range_width = best_resistance - best_support
+        range_mid = (best_resistance + best_support) / 2
+        range_width_pct = (range_width / range_mid) * 100
+
+        # Skip very narrow or very wide ranges
+        if range_width_pct < 2 or range_width_pct > 30:
+            continue
+
+        # Count full cycles (crossings of the midline)
+        midline = range_mid
+        crossings = 0
+        above = close[-1] > midline
+        for p in reversed(close[-SWING_RANGE_LOOKBACK:]):
+            now_above = p > midline
+            if now_above != above:
+                crossings += 1
+                above = now_above
+
+        if crossings < 2:
+            continue
+
+        # Current position in range (0% = at low, 100% = at high)
+        position_in_range = ((current_price - best_support) / range_width) * 100
+        position_in_range = max(0, min(100, position_in_range))
+
+        distance_to_low = ((current_price - best_support) / best_support) * 100
+        distance_to_high = ((best_resistance - current_price) / current_price) * 100
+
+        # Stability score: based on cycle count and test counts
+        stability = min(100, (crossings * 15) + (support_tests * 10) + (resistance_tests * 10))
+        if range_width_pct > 15:
+            stability = int(stability * 0.7)  # penalise very wide ranges
+
+        # Swing trading suggestion
+        swing_entry = best_support * 1.005  # slightly above support
+        swing_target = range_mid             # target is mid-range
+        stop_loss = best_support * 0.97      # 3% below support
+
+        # Combined swing score
+        swing_score = int((stability * 0.4) + (crossings * 15) + (min(support_tests, 5) * 5) + (min(resistance_tests, 5) * 5))
+
+        results.append({
+            "Ticker": raw_ticker,
+            "Current Price": round(current_price, 4),
+            "Range Low": round(best_support, 4),
+            "Range Mid": round(range_mid, 4),
+            "Range High": round(best_resistance, 4),
+            "Range Width (%)": round(range_width_pct, 2),
+            "Support Tests": support_tests,
+            "Resistance Tests": resistance_tests,
+            "Range Cycles": crossings,
+            "Range Stability": stability,
+            "Position in Range (%)": round(position_in_range, 1),
+            "Distance to Low (%)": round(distance_to_low, 2),
+            "Distance to High (%)": round(distance_to_high, 2),
+            "Swing Entry": round(swing_entry, 4),
+            "Swing Target": round(swing_target, 4),
+            "Stop Loss": round(stop_loss, 4),
+            "Swing Score": swing_score,
+        })
+
+    if not results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results)
+    df.sort_values("Swing Score", ascending=False, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+# --------------------------------------------------------------------------
 # Enhanced Entry Price using TradingView Indicators
 # --------------------------------------------------------------------------
 
@@ -1283,9 +1446,13 @@ def build_enhanced_recommendation_and_entry(
 # stays lightweight even after a year+ of daily runs).
 HISTORY_COLUMNS = [
     "Analysis Run Date", "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
-    "Undervalued (Yes/No)", "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
+    "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
+    "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
+    "Support", "Resistance",
+    "P/E Ratio (TTM)", "EPS (TTM)",
+    "MACD Bullish (Yes/No)",
     "Optimal Entry Price", "Stop Loss",
     "Take Profit 1", "Take Profit 2", "Take Profit 3",
 ]
@@ -1541,9 +1708,18 @@ def run(input_path: str, output_path: str) -> None:
     log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
     index_df = fetch_index_snapshot()
 
+    log.info("Detecting swing ranges...")
+    swing_df = detect_swing_range(yf_cache)
+    if not swing_df.empty:
+        log.info("Found %d stocks with swing range patterns", len(swing_df))
+    else:
+        log.info("No swing range patterns detected")
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name="Stock_Analysis", index=False)
         index_df.to_excel(writer, sheet_name="Indices", index=False)
+        if not swing_df.empty:
+            swing_df.to_excel(writer, sheet_name="Swing_Ranges", index=False)
 
     append_daily_history(out_df, output_path)
 

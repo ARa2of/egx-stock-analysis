@@ -484,7 +484,17 @@ def read_history_data() -> Optional[pd.DataFrame]:
         logger.warning(f"Could not read history CSV: {e}")
         return None
 
-def format_github_history(ticker: str, limit: int = 20) -> str:
+def read_swing_data() -> Optional[pd.DataFrame]:
+    """Read the Swing_Ranges sheet from the Excel file on GitHub."""
+    try:
+        response = requests.get(GITHUB_RAW_URL, timeout=10)
+        response.raise_for_status()
+        df = pd.read_excel(io.BytesIO(response.content), sheet_name="Swing_Ranges")
+        return df if df is not None and not df.empty else None
+    except Exception:
+        return None
+
+def format_github_history(ticker: str, limit: int = 30) -> str:
     """Format the last `limit` archived days for a ticker from the GitHub
     history CSV - the objective day-by-day record, independent of whether
     it was ever asked about before."""
@@ -576,13 +586,15 @@ def build_ask_prompt(data_csv: str, question: str, history_text: str = "", index
         f"QUESTION: {question}\n\n"
         "Rules:\n"
         "- Use DATA as source of truth; don't invent figures.\n"
+        "- Compare today vs prior days from HISTORY. Note trends: improving/declining RSI, "
+        "momentum shifts, recommendation changes (e.g. 'Buy 3 days ago → Hold today').\n"
         "- Flag data-backed points vs general reasoning.\n"
-        "- Keep answer under 100 words.\n"
+        "- Keep answer under 150 words.\n"
         "- Telegram formatting only (bold, bullets). No tables."
     )
 
 
-def build_daily_report_prompt(data_csv: str, report_history_text: str = "", searched: bool = False, index_csv: str = "") -> str:
+def build_daily_report_prompt(data_csv: str, report_history_text: str = "", searched: bool = False, index_csv: str = "", ticker_history: str = "") -> str:
     history_section = (
         f"\nPRIOR RECENT REPORTS (for context - note what changed since then):\n{report_history_text}\n"
         if report_history_text else ""
@@ -590,6 +602,10 @@ def build_daily_report_prompt(data_csv: str, report_history_text: str = "", sear
     index_section = (
         f"\nEGX INDEX SNAPSHOT (EGX30/EGX70/EGX33):\n{index_csv}\n"
         if index_csv else ""
+    )
+    ticker_hist_section = (
+        f"\nPRICE HISTORY (last 15 days for top stocks - note trends, momentum changes):\n{ticker_history}\n"
+        if ticker_history else ""
     )
     search_line = (
         "Use search to check for recent news, sector trends, or macro/EGP "
@@ -602,14 +618,18 @@ def build_daily_report_prompt(data_csv: str, report_history_text: str = "", sear
         "a short Telegram report.\n\n"
         f"DATA:\n{data_csv}\n"
         f"{history_section}"
+        f"{ticker_hist_section}"
         f"{index_section}\n"
         "Task: rank the top 5-8 stocks with strongest near-term upside. "
         "Use technical signals (Recommendation, Crosses, RSI, volume, support/"
         f"resistance, R/R) as primary evidence.\n\n{search_line}"
-        "Format (under 200 words):\n"
+        "IMPORTANT: Compare today's values to prior days in the PRICE HISTORY. "
+        "Note trends: is RSI improving or declining? Is the stock moving from "
+        "Buy→Hold or Hold→Buy? Are volume and momentum building or fading?\n\n"
+        "Format (under 250 words):\n"
         "1. Top picks with 1-line rationale each.\n"
         "2. Any stocks with warning signs (1 line each).\n"
-        "3. If prior reports exist: what changed (2-3 lines max).\n\n"
+        "3. What changed vs prior days (trends, momentum shifts).\n\n"
         "Be direct. No introductions. Bold ticker names. Telegram formatting only."
     )
 
@@ -796,6 +816,7 @@ Hi {user.first_name}! I read your Excel analysis and provide stock recommendatio
 /show TICKER - Full analysis for a stock
 /list - All stocks grouped by recommendation
 /indices - EGX30/EGX70/EGX33 snapshot
+/swing TICKER - Detected swing range for a stock
 /ask <question> - Ask AI about stocks
 /aireport - AI shortlist of strongest stocks
 /manage - Your portfolio (add holdings, get advice)
@@ -1037,7 +1058,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     mentioned_tickers = find_mentioned_tickers(question, df)
     history_text = ""
+
     if mentioned_tickers:
+        # User named specific tickers — attach their full history
         parts = []
         for t in mentioned_tickers:
             section = [f"{t}:"]
@@ -1048,6 +1071,19 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             section.append(f"Prior AI insights:\n{ai_hist}")
             parts.append("\n".join(section))
         history_text = "\n\n".join(parts)
+    else:
+        # No tickers mentioned — auto-attach history for top Buy-rated stocks
+        rec_order = {"Buy": 0, "Watch": 1, "Hold": 2, "Avoid": 3}
+        df_sorted = df.copy()
+        df_sorted["_rec_order"] = df_sorted["Recommendation"].map(rec_order).fillna(4)
+        top_tickers = df_sorted.nsmallest(5, "_rec_order")["Selected Stock"].tolist()
+        parts = []
+        for t in top_tickers:
+            gh_hist = format_github_history(t, limit=15)
+            if gh_hist:
+                parts.append(f"{t}:\n{gh_hist}")
+        if parts:
+            history_text = "HISTORY (top-rated stocks, last 15 days):\n\n" + "\n\n".join(parts)
 
     data_csv = build_compact_data_summary(df)
     prompt = build_ask_prompt(data_csv, question, history_text, index_csv=build_index_summary())
@@ -1103,7 +1139,20 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     data_csv = build_compact_data_summary(df)
     report_history_text = format_report_history(get_recent_reports())
-    prompt = build_daily_report_prompt(data_csv, report_history_text, searched=use_search, index_csv=build_index_summary())
+
+    # Attach history for top 8 stocks by recommendation strength
+    rec_order = {"Buy": 0, "Watch": 1, "Hold": 2, "Avoid": 3}
+    df_sorted = df.copy()
+    df_sorted["_rec_order"] = df_sorted["Recommendation"].map(rec_order).fillna(4)
+    top_tickers = df_sorted.nsmallest(8, "_rec_order")["Selected Stock"].tolist()
+    history_parts = []
+    for t in top_tickers:
+        gh_hist = format_github_history(t, limit=15)
+        if gh_hist:
+            history_parts.append(f"{t}:\n{gh_hist}")
+    ticker_history_text = "\n\n".join(history_parts) if history_parts else ""
+
+    prompt = build_daily_report_prompt(data_csv, report_history_text, searched=use_search, index_csv=build_index_summary(), ticker_history=ticker_history_text)
 
     try:
         report = await asyncio.to_thread(call_gemini, prompt, use_search)
@@ -1118,10 +1167,14 @@ async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     remember_report(report)
 
 
-def build_manage_advice_prompt(data_csv: str, holdings_text: str, index_csv: str = "") -> str:
+def build_manage_advice_prompt(data_csv: str, holdings_text: str, index_csv: str = "", ticker_history: str = "") -> str:
     index_section = (
         f"\nEGX INDEX SNAPSHOT:\n{index_csv}\n"
         if index_csv else ""
+    )
+    history_section = (
+        f"\nHISTORY (last 15 days for your holdings - note trends, momentum):\n{ticker_history}\n"
+        if ticker_history else ""
     )
     return (
         "You are a concise portfolio advisor. The user owns specific stocks. "
@@ -1129,10 +1182,12 @@ def build_manage_advice_prompt(data_csv: str, holdings_text: str, index_csv: str
         "Be direct. No introductions.\n\n"
         f"USER'S HOLDINGS:\n{holdings_text}\n\n"
         f"MARKET DATA:\n{data_csv}\n"
+        f"{history_section}"
         f"{index_section}\n"
         "For each holding, state in one line: action (Hold/Buy More/Sell) + "
         "reason based on the data (recommendation, RSI, fair value, support/"
-        "resistance). If a stock looks dangerous, say so bluntly.\n"
+        "resistance). Compare today vs prior days from the HISTORY section - "
+        "note if momentum is improving or declining.\n"
         "End with one overall portfolio risk note (1-2 sentences max).\n"
         "Telegram formatting only. Under 150 words total."
     )
@@ -1238,7 +1293,16 @@ async def manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         data_csv = build_compact_data_summary(df)
         index_csv = build_index_summary()
-        prompt = build_manage_advice_prompt(data_csv, holdings_text, index_csv)
+
+        # Attach history for each holding
+        history_parts = []
+        for ticker in holdings:
+            gh_hist = format_github_history(ticker, limit=15)
+            if gh_hist:
+                history_parts.append(f"{ticker}:\n{gh_hist}")
+        ticker_history = "\n\n".join(history_parts) if history_parts else ""
+
+        prompt = build_manage_advice_prompt(data_csv, holdings_text, index_csv, ticker_history=ticker_history)
 
         try:
             answer = await asyncio.to_thread(call_gemini, prompt, False)
@@ -1254,6 +1318,62 @@ async def manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ Unknown subcommand: {subcommand}\n"
             "Use /manage to see available options."
         )
+
+
+async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show detected swing ranges for a ticker."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /swing TICKER\n"
+            "Example: /swing COMI"
+        )
+        return
+    ticker = context.args[0].upper()
+
+    df = read_swing_data()
+    if df is None or df.empty:
+        await update.message.reply_text("❌ Swing ranges not available yet. Run the analysis first.")
+        return
+
+    # Filter by ticker
+    if "Ticker" in df.columns:
+        tdf = df[df["Ticker"].str.upper() == ticker]
+    elif "Selected Stock" in df.columns:
+        tdf = df[df["Selected Stock"].str.upper() == ticker]
+    else:
+        await update.message.reply_text("❌ Unexpected swing data format.")
+        return
+
+    if tdf.empty:
+        await update.message.reply_text(f"❌ No swing data found for {ticker}.")
+        return
+
+    lines = [f"📈 *{ticker} Swing Ranges*\n"]
+    for _, row in tdf.iterrows():
+        method = row.get("Method", "")
+        support = row.get("Support Level", "")
+        resistance = row.get("Resistance Level", "")
+        low = row.get("Recent Low", "")
+        high = row.get("Recent High", "")
+        date_low = row.get("Low Date", "")
+        date_high = row.get("High Date", "")
+
+        entry = f"*{method}*"
+        if support and not (isinstance(support, float) and pd.isna(support)):
+            entry += f"\n  Support: {support:.2f}" if isinstance(support, (int, float)) else f"\n  Support: {support}"
+        if resistance and not (isinstance(resistance, float) and pd.isna(resistance)):
+            entry += f"\n  Resistance: {resistance:.2f}" if isinstance(resistance, (int, float)) else f"\n  Resistance: {resistance}"
+        if low and not (isinstance(low, float) and pd.isna(low)):
+            entry += f"\n  Recent Low: {low:.2f}" if isinstance(low, (int, float)) else f"\n  Recent Low: {low}"
+        if high and not (isinstance(high, float) and pd.isna(high)):
+            entry += f"\n  Recent High: {high:.2f}" if isinstance(high, (int, float)) else f"\n  Recent High: {high}"
+        if date_low and not (isinstance(date_low, float) and pd.isna(date_low)):
+            entry += f"\n  Low Date: {date_low}"
+        if date_high and not (isinstance(date_high, float) and pd.isna(date_high)):
+            entry += f"\n  High Date: {date_high}"
+        lines.append(entry)
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1272,6 +1392,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /show TICKER — Full analysis for one stock
 /list — All stocks grouped by recommendation
 /indices — EGX30/EGX70/EGX33 index snapshot
+/swing TICKER — Detected swing range (support/resistance)
 
 *AI:*
 /ask <question> — Ask about any stock(s)
@@ -1350,6 +1471,7 @@ def main():
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("aireport", ai_report_command))
     application.add_handler(CommandHandler("manage", manage_command))
+    application.add_handler(CommandHandler("swing", swing_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
