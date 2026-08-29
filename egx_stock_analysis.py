@@ -81,10 +81,16 @@ HISTORY_ARCHIVE_COLUMNS = [
 ]
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
 VOLUME_SPIKE_MULTIPLIER = 1.5
 NEAR_SUPPORT_PCT = 0.03
-BUY_VOL_AVG_DAYS = 42          # 2â€‘month (trading days) for buy volume average
+BUY_VOL_AVG_DAYS = 42          # 2-month (trading days) for buy volume average
+
+# --- New indicator thresholds ---
+ADX_TREND_THRESHOLD = 25       # ADX > 25 = strong trend
+MFI_OVERBOUGHT = 80            # MFI > 80 = overbought
+MFI_OVERSOLD = 20              # MFI < 20 = oversold
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
@@ -1187,6 +1193,12 @@ def build_enhanced_recommendation_and_entry(
     death_cross: Optional[str],
     rsi: Optional[float],
     diamond_cross: Optional[str] = None,
+    adx: Optional[float] = None,
+    adx_plus: Optional[float] = None,
+    adx_minus: Optional[float] = None,
+    mfi: Optional[float] = None,
+    adl: Optional[float] = None,
+    bb_squeeze: Optional[bool] = None,
 ) -> dict:
     """
     Enhanced recommendation with better entry price using TradingView indicators.
@@ -1194,7 +1206,7 @@ def build_enhanced_recommendation_and_entry(
     """
     reasons = []
 
-    # --- Existing signals (unchanged) ---
+    # === CORE SIGNALS ===
     is_undervalued = val.get("undervalued") == "Yes"
     if is_undervalued:
         reasons.append("undervalued")
@@ -1202,7 +1214,7 @@ def build_enhanced_recommendation_and_entry(
     buy_multiplier = mf.get("buy_vol_multiplier")
     is_volume_spike = buy_multiplier is not None and buy_multiplier >= VOLUME_SPIKE_MULTIPLIER
     if is_volume_spike:
-        reasons.append("buy-volume spike (vs 2â€‘month)")
+        reasons.append("buy-volume spike")
 
     support = sr.get("support")
     is_near_support = False
@@ -1214,54 +1226,169 @@ def build_enhanced_recommendation_and_entry(
 
     signal_count = sum([is_undervalued, is_volume_spike, is_near_support])
 
-    # --- Determine trend regime ---
+    # === NEW INDICATOR SIGNALS ===
+    # ADX: trend strength
+    has_strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
+    if has_strong_trend:
+        reasons.append(f"ADX {adx:.1f} (strong trend)")
+
+    # ADX+DI vs ADX-DI: direction confirmation
+    adx_bullish_dir = adx_plus is not None and adx_minus is not None and adx_plus > adx_minus
+    adx_bearish_dir = adx_plus is not None and adx_minus is not None and adx_minus > adx_plus
+    if adx_bullish_dir:
+        reasons.append("ADX+DI > ADX-DI (bullish direction)")
+    elif adx_bearish_dir:
+        reasons.append("ADX-DI > ADX+DI (bearish direction)")
+
+    # MFI: money flow
+    is_mfi_overbought = mfi is not None and mfi >= MFI_OVERBOUGHT
+    is_mfi_oversold = mfi is not None and mfi <= MFI_OVERSOLD
+    if is_mfi_overbought:
+        reasons.append(f"MFI {mfi:.1f} (overbought)")
+    if is_mfi_oversold:
+        reasons.append(f"MFI {mfi:.1f} (oversold)")
+
+    # ADL: accumulation/distribution (cumulative line; positive = net accumulation)
+    is_accumulating = False
+    is_distributing = False
+    if adl is not None:
+        is_accumulating = adl > 0
+        is_distributing = adl < 0
+    if is_accumulating:
+        reasons.append("ADL positive (accumulation)")
+    elif is_distributing:
+        reasons.append("ADL negative (distribution)")
+
+    # BB Squeeze: volatility compression
+    if bb_squeeze is True:
+        reasons.append("BB Squeeze ON (volatility compression)")
+
+    # === DETERMINE TREND REGIME ===
+    # Use ADX direction to reinforce/override Golden/Death Cross
     if golden_cross == "Yes":
         regime = "bullish"
     elif death_cross == "Yes":
         regime = "bearish"
+    elif adx_bullish_dir and has_strong_trend:
+        regime = "bullish"  # ADX confirms bullish even without golden cross
+    elif adx_bearish_dir and has_strong_trend:
+        regime = "bearish"  # ADX confirms bearish even without death cross
     else:
         regime = "unknown"
 
-    # --- Enhanced Entry Price ---
+    # === SCORING SYSTEM ===
+    # Positive signals add, negative signals subtract
+    bull_score = 0
+    bear_score = 0
+
+    # Base signals
+    bull_score += signal_count  # undervalued, volume spike, near support
+
+    # Trend confirmation
+    if regime == "bullish":
+        bull_score += 2
+        reasons.append("Golden Cross confirmed" if golden_cross == "Yes" else "ADX confirms uptrend")
+    elif regime == "bearish":
+        bear_score += 3
+        reasons.append("Death Cross (confirmed downtrend)" if death_cross == "Yes" else "ADX confirms downtrend")
+
+    # Diamond Cross
+    has_diamond = diamond_cross == "Yes"
+    if has_diamond:
+        bull_score += 1
+        reasons.append("Diamond Cross (EMA20>EMA50)")
+
+    # ADX strength bonus
+    if has_strong_trend:
+        if adx_bullish_dir:
+            bull_score += 1
+        elif adx_bearish_dir:
+            bear_score += 1
+
+    # Money flow
+    if is_mfi_oversold and regime != "bearish":
+        bull_score += 1  # oversold in non-bearish = potential bounce
+    if is_mfi_overbought:
+        bear_score += 1
+
+    # Accumulation/Distribution
+    if is_accumulating and regime == "bullish":
+        bull_score += 1
+    if is_distributing and regime != "bullish":
+        bear_score += 1
+
+    # BB Squeeze neutral (noted but doesn't shift score)
+
+    # === RECOMMENDATION DECISION ===
+    overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
+    if overbought:
+        reasons.append(f"RSI overbought ({rsi:.1f})")
+    oversold = rsi is not None and rsi <= RSI_OVERSOLD
+    if oversold:
+        reasons.append(f"RSI oversold ({rsi:.1f})")
+
+    if regime == "bearish" and bear_score >= 3:
+        recommendation = "Avoid"
+    elif regime == "bearish" and bear_score < 3:
+        # Bearish regime but weak signals → Watch (possible reversal)
+        recommendation = "Watch" if is_mfi_oversold or oversold else "Hold"
+        if recommendation == "Watch":
+            reasons.append("weak bearish + oversold → possible reversal")
+    elif overbought:
+        recommendation = "Watch"
+    elif regime == "bullish":
+        if signal_count >= 2 and bull_score >= 4:
+            recommendation = "Buy"
+        elif signal_count >= 1 and bull_score >= 3:
+            recommendation = "Buy" if has_diamond else "Watch"
+        elif bull_score >= 3:
+            recommendation = "Watch"
+        else:
+            recommendation = "Hold"
+    else:  # unknown
+        if bull_score >= 4:
+            recommendation = "Buy"
+        elif bull_score >= 3:
+            recommendation = "Watch"
+        else:
+            recommendation = "Hold"
+
+    # Upgrade: strong ADX + accumulation in uptrend → Buy
+    if (recommendation == "Watch" and has_strong_trend and adx_bullish_dir
+            and is_accumulating and regime == "bullish"):
+        recommendation = "Buy"
+        reasons.append("ADX + accumulation upgrade to Buy")
+
+    # === ENTRY PRICE ===
     if USE_ENHANCED_ENTRY and ind and len(ind) > 0:
-        # Use enhanced entry logic with TradingView indicators
         entry_price, entry_basis = get_enhanced_entry_price(
-            ind,
-            sr.get("support"),
-            current_price,
-            regime,
-            is_near_support
+            ind, sr.get("support"), current_price, regime, is_near_support
         )
     else:
-        # Fallback to original logic
         entry_price, entry_basis = None, ""
         if regime == "bullish":
             if is_near_support and support is not None:
                 entry_price = support
-                entry_basis = "pullback entry at swingâ€‘low support in a confirmed uptrend"
+                entry_basis = "pullback entry at support in a confirmed uptrend"
             elif sma_50 is not None and current_price is not None and sma_50 < current_price:
                 entry_price = sma_50
-                entry_basis = "pullback entry at the rising 50 SMA in a confirmed uptrend"
+                entry_basis = "pullback entry at the rising 50 SMA"
             else:
                 entry_price = current_price
                 entry_basis = "no pullback level identified; current price as reference"
         elif regime == "bearish":
             entry_price = None
-            entry_basis = "confirmed downtrend (Death Cross); no technical entry recommended"
+            entry_basis = "confirmed downtrend; no technical entry recommended"
         else:
             entry_price = None
-            entry_basis = "trend undetermined (insufficient 200â€‘period history)"
+            entry_basis = "trend undetermined"
 
-    # --- Enhanced Stop Loss ---
+    # === STOP LOSS ===
     if USE_ENHANCED_ENTRY and entry_price is not None and ind and len(ind) > 0:
         stop_loss, stop_loss_basis = get_enhanced_stop_loss(
-            ind,
-            sr.get("support"),
-            entry_price,
-            current_price
+            ind, sr.get("support"), entry_price, current_price
         )
     else:
-        # Fallback: 5% below entry
         if entry_price is not None:
             stop_loss = entry_price * 0.95
             stop_loss_basis = "stop at 5% below entry (default)"
@@ -1269,7 +1396,7 @@ def build_enhanced_recommendation_and_entry(
             stop_loss = None
             stop_loss_basis = "no stop loss (no entry)"
 
-    # --- Take Profit Levels ---
+    # === TAKE PROFIT LEVELS ===
     if USE_ENHANCED_ENTRY and entry_price is not None and ind and len(ind) > 0:
         tp_results = calculate_take_profit_levels(ind, current_price, entry_price)
         tp1 = tp_results["take_profit_1"]
@@ -1280,7 +1407,7 @@ def build_enhanced_recommendation_and_entry(
         tp1 = tp2 = tp3 = None
         tp_basis = "no take profit levels (insufficient TA data)"
 
-    # --- Risk/Reward Ratios ---
+    # === RISK/REWARD RATIOS ===
     if entry_price is not None and stop_loss is not None:
         rr_results = calculate_risk_reward(entry_price, stop_loss, tp1, tp2, tp3)
         tp1_rr = rr_results["tp1_rr"]
@@ -1292,38 +1419,6 @@ def build_enhanced_recommendation_and_entry(
     else:
         tp1_rr = tp2_rr = tp3_rr = None
         tp1_reward_pct = tp2_reward_pct = tp3_reward_pct = None
-
-    # --- Recommendation (unchanged logic) ---
-    if regime == "bearish":
-        recommendation = "Avoid"
-        reasons.append("Death Cross (confirmed downtrend)")
-    elif regime == "bullish":
-        overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
-        reasons.append("Golden Cross confirmed")
-        has_diamond = diamond_cross == "Yes"
-        if has_diamond:
-            reasons.append("Diamond Cross (EMA20>EMA50) - short-term momentum bullish")
-        if overbought:
-            recommendation = "Watch"
-            reasons.append(f"RSI overbought ({rsi:.1f})")
-        elif signal_count == 3:
-            recommendation = "Buy"
-        elif signal_count == 2:
-            # Diamond Cross adds extra momentum confluence -> upgrade to Buy
-            recommendation = "Buy" if has_diamond else "Watch"
-        elif signal_count <= 1 and has_diamond:
-            # Fresh momentum shift even without other signals is worth a closer look
-            recommendation = "Watch"
-        else:
-            recommendation = "Hold"
-    else:  # unknown
-        reasons.append("trend undetermined")
-        if signal_count == 3:
-            recommendation = "Buy"
-        elif signal_count == 2:
-            recommendation = "Watch"
-        else:
-            recommendation = "Hold"
 
     basis = ", ".join(reasons) if reasons else "no signals triggered"
     basis = f"{basis}; entry: {entry_basis}" if entry_basis else basis
@@ -1358,6 +1453,7 @@ HISTORY_COLUMNS = [
     "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
+    "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze", "ADL",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance",
     "P/E Ratio (TTM)", "EPS (TTM)",
@@ -1579,6 +1675,8 @@ def run(input_path: str, output_path: str) -> None:
             golden_cross, death_cross,
             rsi,
             diamond_cross,
+            adx, adx_plus, adx_minus,
+            mfi, adl, bb_squeeze,
         )
 
         rows.append({
