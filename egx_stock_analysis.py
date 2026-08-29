@@ -840,6 +840,120 @@ def compute_bb_squeeze(bb_lower: float, bb_upper: float,
     return bb_width < (0.5 * atr)
 
 
+# --------------------------------------------------------------------------
+# ChartScanAI - YOLOv8 Candlestick Pattern Detection
+# --------------------------------------------------------------------------
+
+_chartscan_model = None  # Singleton: loaded once, reused across all stocks
+
+def _get_chartscan_model():
+    """Load the YOLOv8 model once and cache it for all stocks."""
+    global _chartscan_model
+    if _chartscan_model is not None:
+        return _chartscan_model
+    try:
+        from ultralytics import YOLO
+        model_path = os.path.join(os.path.dirname(__file__), "weights", "custom_yolov8.pt")
+        if not os.path.exists(model_path):
+            log.warning("ChartScanAI model not found at %s", model_path)
+            return None
+        _chartscan_model = YOLO(model_path)
+        log.info("ChartScanAI model loaded from %s", model_path)
+        return _chartscan_model
+    except Exception as e:
+        log.warning("Failed to load ChartScanAI model: %s", e)
+        return None
+
+
+def chartscan_analyze(history: pd.DataFrame, ticker: str) -> Optional[dict]:
+    """Run YOLOv8 candlestick pattern detection on a stock chart.
+
+    Generates a candlestick chart from yfinance history, runs YOLO inference,
+    and returns Buy/Sell signal with confidence.
+
+    Returns dict with keys: signal, confidence, buy_patterns, sell_patterns
+    or None on failure.
+    """
+    if history is None or len(history) < 30:
+        return None
+    try:
+        import mplfinance as mpf
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend
+        import matplotlib.pyplot as plt
+        from PIL import Image
+        from io import BytesIO
+
+        model = _get_chartscan_model()
+        if model is None:
+            return None
+
+        # Use latest 180 candles (or all if fewer)
+        chart_data = history.iloc[-180:].copy()
+
+        # Ensure proper datetime index for mplfinance
+        if not isinstance(chart_data.index, pd.DatetimeIndex):
+            chart_data.index = pd.to_datetime(chart_data.index)
+
+        # Generate candlestick chart
+        fig, ax = mpf.plot(
+            chart_data, type="candle", style="yahoo",
+            volume=False, returnfig=True, figsize=(18, 6.5)
+        )
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+
+        # Run YOLO inference
+        img = Image.open(buf)
+        results = model.predict(img, conf=0.3, verbose=False)
+
+        if not results or len(results) == 0:
+            return None
+
+        result = results[0]
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            return {"signal": "Neutral", "confidence": 0.0,
+                    "buy_patterns": 0, "sell_patterns": 0}
+
+        # Parse class labels: class 0 = Buy, class 1 = Sell
+        buy_count = 0
+        sell_count = 0
+        confs = []
+        for box in boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            confs.append(conf)
+            if cls == 0:
+                buy_count += 1
+            elif cls == 1:
+                sell_count += 1
+
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+
+        if buy_count > sell_count:
+            signal = "Buy"
+        elif sell_count > buy_count:
+            signal = "Sell"
+        else:
+            signal = "Neutral"
+
+        log.info("%s: ChartScanAI — signal=%s, conf=%.2f, buy=%d, sell=%d",
+                 ticker, signal, avg_conf, buy_count, sell_count)
+
+        return {
+            "signal": signal,
+            "confidence": round(avg_conf, 4),
+            "buy_patterns": buy_count,
+            "sell_patterns": sell_count,
+        }
+    except Exception as e:
+        log.warning("ChartScanAI failed for %s: %s", ticker, e)
+        return None
+
+
 
 # --------------------------------------------------------------------------
 # Enhanced Entry Price using TradingView Indicators
@@ -1199,6 +1313,7 @@ def build_enhanced_recommendation_and_entry(
     mfi: Optional[float] = None,
     adl: Optional[float] = None,
     bb_squeeze: Optional[bool] = None,
+    cs_signal: Optional[str] = None,
 ) -> dict:
     """
     Enhanced recommendation with better entry price using TradingView indicators.
@@ -1317,7 +1432,35 @@ def build_enhanced_recommendation_and_entry(
     if is_distributing and regime != "bullish":
         bear_score += 1
 
+    # ChartScanAI cross-validation scoring
+    if cs_agrees_buy and regime == "bullish":
+        bull_score += 2  # strong confirmation
+    elif cs_agrees_buy:
+        bull_score += 1  # possible early signal
+    if cs_agrees_sell and regime == "bearish":
+        bear_score += 2  # strong confirmation
+    elif cs_agrees_sell:
+        bear_score += 1
+    if cs_conflict_buy:
+        bear_score += 1  # conflict reduces confidence
+    if cs_conflict_sell:
+        bull_score -= 1  # conflict reduces confidence
+
     # BB Squeeze neutral (noted but doesn't shift score)
+
+    # ChartScanAI cross-validation
+    cs_agrees_buy = cs_signal == "Buy"
+    cs_agrees_sell = cs_signal == "Sell"
+    cs_conflict_buy = cs_agrees_sell and regime == "bullish"
+    cs_conflict_sell = cs_agrees_buy and regime == "bearish"
+    if cs_agrees_buy:
+        reasons.append("ChartScanAI confirms Buy")
+    if cs_agrees_sell:
+        reasons.append("ChartScanAI confirms Sell")
+    if cs_conflict_buy:
+        reasons.append("ChartScanAI conflicts (says Sell in uptrend)")
+    if cs_conflict_sell:
+        reasons.append("ChartScanAI conflicts (says Buy in downtrend)")
 
     # === RECOMMENDATION DECISION ===
     overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
@@ -1454,6 +1597,7 @@ HISTORY_COLUMNS = [
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze", "ADL",
+    "ChartScanAI Signal", "ChartScanAI Confidence",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance",
     "P/E Ratio (TTM)", "EPS (TTM)",
@@ -1668,6 +1812,13 @@ def run(input_path: str, output_path: str) -> None:
         if macd is not None and macd_signal is not None:
             macd_bullish = "Yes" if macd > macd_signal else "No"
 
+        # ChartScanAI: YOLOv8 candlestick pattern detection
+        cs_result = chartscan_analyze(yf_entry.history, raw)
+        cs_signal = cs_result["signal"] if cs_result else None
+        cs_confidence = cs_result["confidence"] if cs_result else None
+        cs_buy_patterns = cs_result["buy_patterns"] if cs_result else None
+        cs_sell_patterns = cs_result["sell_patterns"] if cs_result else None
+
         # Enhanced Recommendation & Entry
         rec = build_enhanced_recommendation_and_entry(
             val, mf, sr, ind, current_price,
@@ -1677,6 +1828,7 @@ def run(input_path: str, output_path: str) -> None:
             diamond_cross,
             adx, adx_plus, adx_minus,
             mfi, adl, bb_squeeze,
+            cs_signal,
         )
 
         rows.append({
@@ -1739,6 +1891,10 @@ def run(input_path: str, output_path: str) -> None:
             "TP3 Reward %": rec["tp3_reward_pct"],
             "Recommendation": rec["recommendation"],
             "Recommendation Basis": rec["recommendation_basis"],
+            "ChartScanAI Signal": cs_signal,
+            "ChartScanAI Confidence": round(cs_confidence, 4) if cs_confidence is not None else None,
+            "ChartScanAI Buy Patterns": cs_buy_patterns,
+            "ChartScanAI Sell Patterns": cs_sell_patterns,
         })
 
     if not rows:

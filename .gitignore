@@ -1,2 +1,10 @@
 ai_memory.json
 webhook_handler.py
+egx-stock-analysis/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/

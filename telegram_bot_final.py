@@ -91,6 +91,7 @@ GEMINI_SUMMARY_COLUMNS = [
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze",
+    "ChartScanAI Signal", "ChartScanAI Confidence",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
     "Take Profit 1", "Take Profit 2", "Take Profit 3",
@@ -792,6 +793,11 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • MFI: {format_number(data.get('MFI'))}",
         f"  • ADL: {format_number(data.get('ADL'), 0)}",
         "",
+        f"🤖 *CHARTSCAN AI:*",
+        f"  • Signal: {'🟢 Buy' if data.get('ChartScanAI Signal') == 'Buy' else '🔴 Sell' if data.get('ChartScanAI Signal') == 'Sell' else '⚪ Neutral'}",
+        f"  • Confidence: {format_number(data.get('ChartScanAI Confidence'), '.0%') if data.get('ChartScanAI Confidence') is not None else 'N/A'}",
+        f"  • Buy patterns: {format_number(data.get('ChartScanAI Buy Patterns'), '.0f')} | Sell patterns: {format_number(data.get('ChartScanAI Sell Patterns'), '.0f')}",
+        "",
         f"📊 *SUPPORT/RESISTANCE:*",
         f"  • Support: {format_number(data.get('Support'))}",
         f"  • Resistance: {format_number(data.get('Resistance'))}",
@@ -863,6 +869,7 @@ Hi {user.first_name}! I read your Excel analysis and provide stock recommendatio
 /show TICKER - Full analysis for a stock
 /list - All stocks grouped by recommendation
 /indices - EGX30/EGX70/EGX33 snapshot
+/chartscan TICKER - Run YOLOv8 candlestick pattern detection
 /ask <question> - Ask AI about stocks
 /aireport - AI shortlist of strongest stocks
 /manage - Your portfolio (add holdings, get advice)
@@ -921,10 +928,22 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 price_str = format_number(price) if price else "N/A"
                 undervalued = "💎" if row.get("Undervalued (Yes/No)") == "Yes" else ""
                 diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
-                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}{diamond}")
+                # ChartScanAI conflict indicator
+                cs_signal = row.get("ChartScanAI Signal", "")
+                if cs_signal == "Buy" and rec == "Avoid":
+                    cs_mark = " ⚠️🤖"
+                elif cs_signal == "Sell" and rec == "Buy":
+                    cs_mark = " ⚠️🤖"
+                elif cs_signal == "Buy" and rec == "Buy":
+                    cs_mark = " ✅🤖"
+                else:
+                    cs_mark = ""
+                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}{diamond}{cs_mark}")
             lines.append("")
     
     lines.append("_Click a button to analyze any ticker!_")
+    lines.append("")
+    lines.append("🤖 ChartScanAI: ✅=both agree | ⚠️=conflict")
     
     # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()
@@ -1159,6 +1178,86 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         match = df[df["Selected Stock"].astype(str).str.upper() == t]
         if not match.empty:
             remember_stock_snapshot(t, match.iloc[0].to_dict(), answer)
+
+async def chartscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run on-demand ChartScanAI analysis for a ticker."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /chartscan TICKER\n"
+            "Example: /chartscan COMI\n\n"
+            "Runs YOLOv8 candlestick pattern detection on the latest chart."
+        )
+        return
+    ticker = context.args[0].upper()
+
+    await update.message.reply_text(f"🤖 Running ChartScanAI on {ticker}...")
+
+    try:
+        import yfinance as yf
+        import sys
+        sys.path.insert(0, os.path.dirname(__file__))
+        from egx_stock_analysis import chartscan_analyze
+
+        # Download fresh data
+        data = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+        if data.empty:
+            await update.message.reply_text(f"❌ No data found for {ticker}")
+            return
+
+        # Flatten multi-level columns if present
+        if hasattr(data.columns, 'levels') and len(data.columns.levels) > 1:
+            data.columns = data.columns.get_level_values(0)
+
+        result = chartscan_analyze(data, ticker)
+
+        if result is None:
+            await update.message.reply_text(
+                f"❌ ChartScanAI analysis failed for {ticker}.\n"
+                "The model may not have detected any patterns."
+            )
+            return
+
+        signal = result["signal"]
+        conf = result["confidence"]
+        buy_p = result["buy_patterns"]
+        sell_p = result["sell_patterns"]
+
+        signal_emoji = "🟢 Buy" if signal == "Buy" else "🔴 Sell" if signal == "Sell" else "⚪ Neutral"
+
+        # Also show indicator recommendation for comparison
+        df = read_analysis_data()
+        ind_rec = "N/A"
+        if df is not None:
+            match = df[df["Selected Stock"].str.upper() == ticker]
+            if not match.empty:
+                ind_rec = match.iloc[0].get("Recommendation", "N/A")
+
+        # Agreement check
+        if signal == "Buy" and ind_rec == "Buy":
+            verdict = "✅ AGREE — Both methods say Buy"
+        elif signal == "Sell" and ind_rec in ("Avoid", "Hold"):
+            verdict = "✅ AGREE — Both methods bearish"
+        elif signal == "Buy" and ind_rec in ("Avoid", "Hold"):
+            verdict = "⚠️ CONFLICT — ChartScanAI says Buy, indicators disagree"
+        elif signal == "Sell" and ind_rec == "Buy":
+            verdict = "⚠️ CONFLICT — ChartScanAI says Sell, indicators say Buy"
+        else:
+            verdict = "— Mixed signals"
+
+        text = (
+            f"🤖 *ChartScanAI — {ticker}*\n"
+            f"{'=' * 30}\n\n"
+            f"*YOLOv8 Signal:* {signal_emoji}\n"
+            f"*Confidence:* {conf:.0%}\n"
+            f"*Buy patterns detected:* {buy_p}\n"
+            f"*Sell patterns detected:* {sell_p}\n\n"
+            f"*Indicator Recommendation:* {ind_rec}\n"
+            f"*Verdict:* {verdict}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the current chat ID (useful for debugging/config)."""
@@ -1395,7 +1494,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Analysis:</b>\n"
         "/show TICKER — Full analysis for one stock\n"
         "/list — All stocks grouped by recommendation\n"
-        "/indices — EGX30/EGX70/EGX33 index snapshot\n\n"
+        "/indices — EGX30/EGX70/EGX33 index snapshot\n"
+        "/chartscan TICKER — YOLOv8 candlestick pattern detection\n\n"
         "<b>AI:</b>\n"
         "/ask &lt;question&gt; — Ask about any stock(s)\n"
         "  /ask how does COMI look?\n"
@@ -1470,6 +1570,7 @@ def main():
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("aireport", ai_report_command))
     application.add_handler(CommandHandler("manage", manage_command))
+    application.add_handler(CommandHandler("chartscan", chartscan_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
