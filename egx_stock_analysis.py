@@ -1321,10 +1321,6 @@ def build_enhanced_recommendation_and_entry(
     reasons = []
 
     # === CORE SIGNALS ===
-    is_undervalued = val.get("undervalued") == "Yes"
-    if is_undervalued:
-        reasons.append("undervalued")
-
     buy_multiplier = mf.get("buy_vol_multiplier")
     is_volume_spike = buy_multiplier is not None and buy_multiplier >= VOLUME_SPIKE_MULTIPLIER
     if is_volume_spike:
@@ -1338,7 +1334,7 @@ def build_enhanced_recommendation_and_entry(
     if is_near_support:
         reasons.append("near support")
 
-    signal_count = sum([is_undervalued, is_volume_spike, is_near_support])
+    signal_count = sum([is_volume_spike, is_near_support])
 
     # === NEW INDICATOR SIGNALS ===
     # ADX: trend strength
