@@ -765,6 +765,16 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
         "",
         f"{emoji} *RECOMMENDATION:* {rec}",
+        f"🎯 *Score:* {format_number(data.get('Score'), 0)}/100"
+        + (
+            f"  (Trend {format_number(data.get('Score - Trend'), 0)} · "
+            f"MACD {format_number(data.get('Score - MACD'), 0)} · "
+            f"RSI {format_number(data.get('Score - RSI'), 0)} · "
+            f"Vol {format_number(data.get('Score - Volume'), 0)} · "
+            f"ADI {format_number(data.get('Score - ADI'), 0)} · "
+            f"Supp {format_number(data.get('Score - Support'), 0)})"
+            if data.get('Score - Trend') is not None else ""
+        ),
         f"📝 *Basis:* {_escape_md(data.get('Recommendation Basis', 'N/A'))}",
         "",
         f"💰 *PRICES:*",
@@ -794,7 +804,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • Recommendation: {'🟢 Buy' if data.get('ChartScanAI Recommendation') == 'Buy' else '🔴 Avoid' if data.get('ChartScanAI Recommendation') == 'Avoid' else '🔵 Hold' if data.get('ChartScanAI Recommendation') == 'Hold' else 'N/A'}",
         f"  • Signal: {data.get('ChartScanAI Signal', 'N/A')}",
         f"  • Confidence: {data.get('ChartScanAI Confidence', 0):.0%}" if data.get('ChartScanAI Confidence') is not None else "  • Confidence: N/A",
-        f"  • Patterns: {format_number(data.get('ChartScanAI Buy Patterns'), '.0f')} buy / {format_number(data.get('ChartScanAI Sell Patterns'), '.0f')} sell",
+        f"  • Patterns: {format_number(data.get('ChartScanAI Buy Patterns'), 0)} buy / {format_number(data.get('ChartScanAI Sell Patterns'), 0)} sell",
         "",
         f"📊 *SUPPORT/RESISTANCE:*",
         f"  • Support: {format_number(data.get('Support'))}",
@@ -904,60 +914,110 @@ async def show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     response = format_stock_response(data)
     await update.message.reply_text(response, parse_mode="Markdown", disable_web_page_preview=True)
 
+def classify_display_recommendation(base_rec: Optional[str], cs_rec: Optional[str]) -> tuple:
+    """
+    Combine the base (indicator) recommendation with the ChartScanAI
+    secondary signal into a single display category for /list:
+      - Strong Buy: both methods say Buy
+      - Buy: exactly one method says Buy (the other method is noted as
+        the conflicting/non-confirming one)
+      - otherwise: falls back to the base recommendation (Watch/Avoid)
+
+    A stock is classified into exactly ONE bucket - never both Strong Buy
+    and Buy - so it's listed once, not duplicated.
+
+    Returns (category, note) where note is a short string explaining any
+    conflict/lack of secondary confirmation, or None when there's nothing
+    to flag (e.g. Strong Buy, or a plain Watch/Avoid with no Buy signal
+    from either method).
+    """
+    base_rec = base_rec or "Avoid"
+    base_buy = base_rec == "Buy"
+    cs_buy = cs_rec == "Buy"
+
+    if base_buy and cs_buy:
+        return "Strong Buy", None
+
+    if base_buy and not cs_buy:
+        if cs_rec == "Avoid":
+            return "Buy", "⚠️ ChartScanAI says Avoid"
+        elif cs_rec == "Hold":
+            return "Buy", "ChartScanAI neutral"
+        else:
+            return "Buy", "ChartScanAI: no signal"
+
+    if cs_buy and not base_buy:
+        return "Buy", f"⚠️ base indicators say {base_rec}"
+
+    # Neither method says Buy - use the base recommendation as-is.
+    return base_rec, None
+
+
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show all tickers with quick analysis buttons."""
     df = read_analysis_data()
     if df is None or df.empty:
         await update.message.reply_text("📋 No tickers found in the Excel file.")
         return
-    
-    # Create formatted list with recommendations
+
+    has_chartscan = "ChartScanAI Recommendation" in df.columns
+    has_score = "Score" in df.columns
+
+    # Classify every stock into exactly one bucket (Strong Buy / Buy / Watch
+    # / Avoid), combining the base recommendation with ChartScanAI so a
+    # stock never appears in more than one section.
+    buckets: Dict[str, list] = {"Strong Buy": [], "Buy": [], "Watch": [], "Avoid": []}
+    for _, row in df.iterrows():
+        base_rec = row.get("Recommendation")
+        cs_rec = row.get("ChartScanAI Recommendation") if has_chartscan else None
+        category, note = classify_display_recommendation(base_rec, cs_rec)
+        buckets.setdefault(category, []).append((row, note))
+
     lines = ["📋 *PORTFOLIO SUMMARY*", "=" * 30, ""]
-    
-    # Strong Buy: both indicators AND ChartScanAI say Buy
-    strong_buy = df[
-        (df["Recommendation"] == "Buy") & 
-        (df["ChartScanAI Recommendation"] == "Buy")
-    ].sort_values("ChartScanAI Confidence", ascending=False)
-    if not strong_buy.empty:
-        lines.append(f"🔥 *STRONG BUY* ({len(strong_buy)}) — Both methods agree")
-        for _, row in strong_buy.iterrows():
-            ticker = row["Selected Stock"]
+
+    section_meta = {
+        "Strong Buy": ("🔥", "STRONG BUY"),
+        "Buy": ("🟢", "BUY"),
+        "Watch": ("🟡", "WATCH"),
+        "Avoid": ("🔴", "AVOID"),
+    }
+
+    for category in ["Strong Buy", "Buy", "Watch", "Avoid"]:
+        entries = buckets.get(category, [])
+        if not entries:
+            continue
+
+        # Sort by Score (base 0-100 score) when available, else leave as-is;
+        # Strong Buy breaks ties by ChartScanAI confidence.
+        def _sort_key(item):
+            row, _ = item
+            score = row.get("Score") if has_score else None
+            score = score if score is not None and not pd.isna(score) else -1
+            conf = row.get("ChartScanAI Confidence") if has_chartscan else None
+            conf = conf if conf is not None and not pd.isna(conf) else -1
+            return (score, conf)
+
+        entries.sort(key=_sort_key, reverse=True)
+
+        emoji, title = section_meta[category]
+        lines.append(f"{emoji} *{title}* ({len(entries)})")
+        for row, note in entries:
+            ticker = row.get("Selected Stock", "?")
             price = row.get("Current EGP Price")
             price_str = format_number(price) if price else "N/A"
-            conf = row.get("ChartScanAI Confidence", 0) or 0
-            lines.append(f"  • {ticker} @ {price_str} EGP (🤖 {conf:.0%})")
+            diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
+            score = row.get("Score") if has_score else None
+            score_str = f" | Score: {score:.0f}/100" if score is not None and not pd.isna(score) else ""
+            note_str = f" ({note})" if note else ""
+            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
         lines.append("")
-    
-    # Group by recommendation (excluding Strong Buy from Buy section)
-    for rec in ["Buy", "Watch", "Hold", "Avoid"]:
-        rec_df = df[df["Recommendation"] == rec]
-        if not rec_df.empty:
-            emoji = {"Buy": "🟢", "Watch": "🟡", "Hold": "🔵", "Avoid": "🔴"}.get(rec, "⚪")
-            lines.append(f"{emoji} *{rec.upper()}* ({len(rec_df)})")
-            for _, row in rec_df.iterrows():
-                ticker = row["Selected Stock"]
-                price = row.get("Current EGP Price")
-                price_str = format_number(price) if price else "N/A"
-                diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
-                cs_rec = row.get("ChartScanAI Recommendation", "")
-                is_strong = (rec == "Buy" and cs_rec == "Buy")
-                if is_strong:
-                    cs_mark = ""  # already shown in Strong Buy section
-                elif cs_rec == rec:
-                    cs_mark = " ✅🤖"
-                elif cs_rec and cs_rec != rec and cs_rec in ("Buy", "Avoid"):
-                    cs_mark = " ⚠️🤖"
-                else:
-                    cs_mark = ""
-                lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{cs_mark}")
-            lines.append("")
-    
+
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
-    lines.append("🔥 Strong Buy = both indicators + ChartScanAI agree")
-    lines.append("🤖 ✅=agree | ⚠️=conflict")
-    
+    lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
+    lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
+    lines.append("🟡/🔴 Watch/Avoid = base score, no Buy signal from either method")
+
     # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()
     keyboard = []
@@ -970,7 +1030,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             row = []
     if row:
         keyboard.append(row)
-    
+
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=reply_markup)
 
@@ -1209,10 +1269,13 @@ async def chartscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         import yfinance as yf
         import sys
         sys.path.insert(0, os.path.dirname(__file__))
-        from egx_stock_analysis import chartscan_analyze
+        from egx_stock_analysis import chartscan_analyze, to_yf_ticker
 
-        # Download fresh data
-        data = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+        # Download fresh data. EGX tickers need the ".CA" suffix on Yahoo
+        # Finance (e.g. "COMI" -> "COMI.CA") - to_yf_ticker() is the same
+        # helper the main analysis script uses, so this stays in sync with it.
+        yf_ticker = to_yf_ticker(ticker)
+        data = yf.download(yf_ticker, period="1y", progress=False, auto_adjust=True)
         if data.empty:
             await update.message.reply_text(f"❌ No data found for {ticker}")
             return
