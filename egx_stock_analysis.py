@@ -764,537 +764,75 @@ def support_resistance(raw_ticker: str, yf_cache: Dict[str, TickerData]) -> dict
 
 
 # --------------------------------------------------------------------------
-# Swing Range Detection
-# --------------------------------------------------------------------------
-# Swing Range Detection â€” Adaptive Two-Window Approach
+# Accumulation / Distribution & Money Flow Indicators
 # --------------------------------------------------------------------------
 
-# Long window: pattern discovery (6 months)
-SWING_HISTORY_MONTHS = 126       # ~6 months of trading days
-# Short window default: current range detection (3 weeks)
-SWING_RECENT_DEFAULT = 15        # fallback if cycle detection fails
-# Minimum cycle duration to consider
-SWING_MIN_CYCLE = 3
-# Maximum cycle duration to consider
-SWING_MAX_CYCLE = 40
-# Range suitability threshold (0-100)
-SWING_SUITABILITY_THRESHOLD = 35
-# Exponential decay half-life for weighting (trading days)
-SWING_DECAY_HALF_LIFE = 5
-# Cluster tolerance: ATR multiplier
-SWING_CLUSTER_ATR_MULT = 0.5
-# Minimum support/resistance tests in current window
-SWING_MIN_CURRENT_TESTS = 2
-# Minimum range width (% of mid)
-SWING_MIN_WIDTH_PCT = 1.5
-# Maximum range width (% of mid)
-SWING_MAX_WIDTH_PCT = 35
-# Minimum midline crossings in current window
-SWING_MIN_CROSSINGS = 1
+def compute_adl(history: pd.DataFrame) -> Optional[float]:
+    """Compute the Accumulation/Distribution Line.
 
+    ADL = cumsum(((Close - Low) - (High - Close)) / (High - Low) * Volume)
 
-# â”€â”€ Statistical helper functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-def _hurst_exponent(prices: np.ndarray) -> float:
-    """Estimate the Hurst exponent using the rescaled range (R/S) method.
-
-    H < 0.5 â†’ mean-reverting (range-bound)
-    H â‰ˆ 0.5 â†’ random walk
-    H > 0.5 â†’ trending
+    Returns the latest ADL value, or None if data is insufficient.
     """
-    n = len(prices)
-    if n < 20:
-        return 0.5
-    max_k = min(n // 2, 50)
-    sizes = []
-    rs_values = []
-    for k in range(10, max_k + 1, 2):
-        sub = prices[:k]
-        mean = np.mean(sub)
-        deviations = np.cumsum(sub - mean)
-        r = np.max(deviations) - np.min(deviations)
-        s = np.std(sub, ddof=1)
-        if s > 0:
-            sizes.append(k)
-            rs_values.append(r / s)
-    if len(sizes) < 3:
-        return 0.5
-    log_sizes = np.log(sizes)
-    log_rs = np.log(rs_values)
-    coeffs = np.polyfit(log_sizes, log_rs, 1)
-    return float(np.clip(coeffs[0], 0.0, 1.0))
+    if history is None or len(history) < 5:
+        return None
+    try:
+        high = history["High"].values.astype(float)
+        low = history["Low"].values.astype(float)
+        close = history["Close"].values.astype(float)
+        vol = history["Volume"].values.astype(float)
+        hl_range = high - low
+        # Avoid division by zero
+        hl_range[hl_range == 0] = 1e-10
+        clv = ((close - low) - (high - close)) / hl_range
+        adl = np.cumsum(clv * vol)
+        return float(adl[-1])
+    except Exception:
+        return None
 
 
-def _price_r_squared(closes: np.ndarray) -> float:
-    """RÂ² of linear regression on price. Low = no trend, High = trending."""
-    n = len(closes)
-    if n < 10:
-        return 0.5
-    x = np.arange(n)
-    coeffs = np.polyfit(x, closes, 1)
-    predicted = np.polyval(coeffs, x)
-    ss_res = np.sum((closes - predicted) ** 2)
-    ss_tot = np.sum((closes - np.mean(closes)) ** 2)
-    if ss_tot == 0:
-        return 1.0
-    return float(1.0 - ss_res / ss_tot)
+def compute_mfi(history: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """Compute Money Flow Index (volume-weighted RSI).
 
+    MFI = 100 - (100 / (1 + positive_money_flow / negative_money_flow))
 
-def _bb_width_consistency(closes: np.ndarray, period: int = 20) -> float:
-    """Coefficient of variation of Bollinger Band width. Low = stable volatility."""
-    if len(closes) < period + 5:
-        return 1.0
-    widths = []
-    for i in range(period, len(closes)):
-        window = closes[i - period: i]
-        ma = np.mean(window)
-        std = np.std(window, ddof=1)
-        if ma > 0:
-            widths.append((2 * std) / ma)
-    if len(widths) < 5:
-        return 1.0
-    arr = np.array(widths)
-    mean_w = np.mean(arr)
-    if mean_w == 0:
-        return 1.0
-    return float(np.std(arr, ddof=1) / mean_w)
-
-
-def _autocorrelation_cycle(closes: np.ndarray, max_lag: int = 40) -> int:
-    """Find dominant cycle period via autocorrelation of price deviations."""
-    n = len(closes)
-    if n < max_lag + 20:
-        return 0
-    window = min(20, n // 3)
-    rolling_mean = np.convolve(closes, np.ones(window) / window, mode="valid")
-    if len(rolling_mean) < max_lag + 5:
-        return 0
-    detrended = closes[-len(rolling_mean):] - rolling_mean
-    mean_d = np.mean(detrended)
-    var_d = np.var(detrended)
-    if var_d == 0:
-        return 0
-    acf = []
-    for lag in range(3, min(max_lag + 1, len(detrended) // 2)):
-        c = np.mean((detrended[:len(detrended) - lag] - mean_d) *
-                     (detrended[lag:] - mean_d))
-        acf.append(c / var_d)
-    if not acf:
-        return 0
-    for i in range(1, len(acf) - 1):
-        if acf[i] > acf[i - 1] and acf[i] > acf[i + 1] and acf[i] > 0.15:
-            return i + 3
-    best_lag = int(np.argmax(acf)) + 3
-    return best_lag if acf[int(np.argmax(acf))] > 0.1 else 0
-
-
-def _swing_point_intervals(highs: np.ndarray, lows: np.ndarray,
-                           order: int = 2) -> Tuple[float, float]:
-    """Find fractal swing points and return (median_interval, consistency)."""
-    n = len(highs)
-    if n < 2 * order + 5:
-        return 0.0, 0.0
-    swing_indices = []
-    for i in range(order, n - order):
-        if highs[i] == highs[i - order: i + order + 1].max():
-            swing_indices.append(i)
-        if lows[i] == lows[i - order: i + order + 1].min():
-            swing_indices.append(i)
-    swing_indices = sorted(set(swing_indices))
-    if len(swing_indices) < 4:
-        return 0.0, 0.0
-    intervals = [swing_indices[i + 1] - swing_indices[i]
-                 for i in range(len(swing_indices) - 1)]
-    if not intervals:
-        return 0.0, 0.0
-    med = float(np.median(intervals))
-    std = float(np.std(intervals))
-    consistency = max(0.0, 1.0 - (std / med)) if med > 0 else 0.0
-    return med, consistency
-
-
-def _compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-                 period: int = 14) -> float:
-    """Compute Average True Range."""
-    if len(closes) < 2:
-        return 0.0
-    trs = []
-    for i in range(1, len(highs)):
-        tr = max(highs[i] - lows[i],
-                 abs(highs[i] - closes[i - 1]),
-                 abs(lows[i] - closes[i - 1]))
-        trs.append(tr)
-    if not trs:
-        return 0.0
-    return float(np.array(trs[-period:]).mean())
-
-
-def _exponential_weights(n: int, half_life: float = SWING_DECAY_HALF_LIFE) -> np.ndarray:
-    """Generate exponential decay weights. Most recent bar = weight 1."""
-    weights = np.array([2.0 ** (-i / half_life) for i in range(n)])
-    return weights / weights[0]
-
-
-def _find_weighted_extrema(highs: np.ndarray, lows: np.ndarray,
-                           weights: np.ndarray, order: int = 2
-                           ) -> Tuple[List[float], List[float]]:
-    """Find fractal extrema on weight-adjusted prices."""
-    wh = highs * weights
-    wl = lows * weights
-    n = len(wh)
-    fractal_highs: List[float] = []
-    fractal_lows: List[float] = []
-    for i in range(order, n - order):
-        h_win = wh[i - order: i + order + 1]
-        l_win = wl[i - order: i + order + 1]
-        if wh[i] == h_win.max():
-            fractal_highs.append(float(highs[i]))
-        if wl[i] == l_win.min():
-            fractal_lows.append(float(lows[i]))
-    return fractal_highs, fractal_lows
-
-
-def _cluster_levels(levels: List[float], tol: float) -> List[Tuple[float, int]]:
-    """Cluster nearby price levels. Returns (mean, count) sorted by count."""
-    if not levels:
-        return []
-    levels = sorted(levels)
-    clusters: List[List[float]] = [[levels[0]]]
-    for lv in levels[1:]:
-        if abs(lv - clusters[-1][-1]) <= tol:
-            clusters[-1].append(lv)
-        else:
-            clusters.append([lv])
-    result = [(float(np.mean(c)), len(c)) for c in clusters]
-    result.sort(key=lambda x: x[1], reverse=True)
-    return result
-
-
-def _count_midline_crossings(close: np.ndarray, midline: float,
-                             lookback: int) -> int:
-    """Count midline crossings within lookback bars."""
-    window = close[-lookback:]
-    crossings = 0
-    above = window[0] > midline
-    for p in window[1:]:
-        now_above = p > midline
-        if now_above != above:
-            crossings += 1
-            above = now_above
-    return crossings
-
-
-def _find_fractal_levels(highs: np.ndarray, lows: np.ndarray,
-                         order: int = 2) -> Tuple[List[float], List[float]]:
-    """Find fractal highs/lows on actual High/Low arrays."""
-    fractal_highs: List[float] = []
-    fractal_lows: List[float] = []
-    n = len(highs)
-    for i in range(order, n - order):
-        if highs[i] == highs[i - order: i + order + 1].max():
-            fractal_highs.append(float(highs[i]))
-        if lows[i] == lows[i - order: i + order + 1].min():
-            fractal_lows.append(float(lows[i]))
-    return fractal_highs, fractal_lows
-
-
-def _classify_stock(hurst: float, r_squared: float,
-                    bb_cv: float, cycle_period: float,
-                    cycle_consistency: float) -> Tuple[str, float]:
-    """Classify stock behaviour and return (label, suitability_score)."""
-    if cycle_period <= 0:
-        return "Insufficient Data", 0.0
-
-    if hurst < 0.35:
-        hurst_score = 30
-    elif hurst < 0.45:
-        hurst_score = 25
-    elif hurst < 0.50:
-        hurst_score = 15
-    elif hurst < 0.55:
-        hurst_score = 5
-    else:
-        hurst_score = 0
-
-    if r_squared < 0.2:
-        r2_score = 20
-    elif r_squared < 0.4:
-        r2_score = 15
-    elif r_squared < 0.6:
-        r2_score = 5
-    else:
-        r2_score = 0
-
-    if bb_cv < 0.2:
-        bb_score = 20
-    elif bb_cv < 0.35:
-        bb_score = 15
-    elif bb_cv < 0.5:
-        bb_score = 10
-    else:
-        bb_score = 0
-
-    cycle_score = int(cycle_consistency * 15)
-
-    if 3 <= cycle_period <= 25:
-        dur_score = 15
-    elif 25 < cycle_period <= 40:
-        dur_score = 8
-    else:
-        dur_score = 3
-
-    total = hurst_score + r2_score + bb_score + cycle_score + dur_score
-    total = min(100, max(0, total))
-
-    if total >= 70:
-        return "Strong Range", total
-    elif total >= 50:
-        return "Moderate Range", total
-    elif total >= SWING_SUITABILITY_THRESHOLD:
-        return "Possible Range", total
-    elif r_squared > 0.6 and hurst > 0.55:
-        return "Trending", total
-    elif bb_cv > 0.5:
-        return "Volatile", total
-    else:
-        return "Below Threshold", total
-
-
-# â”€â”€ Main swing range detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-def detect_swing_range(yf_cache: Dict[str, TickerData],
-                       ta_cache: Optional[Dict[str, "TickerTA"]] = None) -> pd.DataFrame:
-    """Detect stocks with repeatable swing-range behaviour.
-
-    Two-window adaptive approach:
-      1. Long window (~6 months): classify stock behaviour, discover
-         typical cycle duration, identify historical S/R zones.
-      2. Short window (adaptive): detect the current active range using
-         exponential decay weighting so the most recent week dominates.
-
-    Only stocks that pass the suitability filter (trending towards
-    mean-reverting with stable volatility) get ranges assigned.
+    Returns the latest MFI value (0-100), or None if data is insufficient.
     """
-    if ta_cache is None:
-        ta_cache = {}
-    adaptive_results: Dict[str, dict] = {}
-    cluster_results: Dict[str, dict] = {}
+    if history is None or len(history) < period + 2:
+        return None
+    try:
+        tp = ((history["High"] + history["Low"] + history["Close"]) / 3).values
+        vol = history["Volume"].values.astype(float)
+        raw_mf = tp * vol
+        pos_flow = 0.0
+        neg_flow = 0.0
+        for i in range(1, len(tp)):
+            if tp[i] > tp[i - 1]:
+                pos_flow += raw_mf[i]
+            elif tp[i] < tp[i - 1]:
+                neg_flow += raw_mf[i]
+        if neg_flow == 0:
+            return 100.0
+        mfr = pos_flow / neg_flow
+        mfi = 100.0 - (100.0 / (1.0 + mfr))
+        return float(mfi)
+    except Exception:
+        return None
 
-    for raw_ticker, entry in yf_cache.items():
-        if entry is None or not entry.ok:
-            continue
 
-        hist = entry.history.tail(SWING_HISTORY_MONTHS + 20)
-        if len(hist) < SWING_HISTORY_MONTHS * 0.6:
-            continue
+def compute_bb_squeeze(bb_lower: float, bb_upper: float,
+                       atr: float) -> Optional[bool]:
+    """Detect Bollinger Band squeeze.
 
-        close = hist["Close"].values.astype(float)
-        highs = hist["High"].values.astype(float) if "High" in hist.columns else close.copy()
-        lows = hist["Low"].values.astype(float) if "Low" in hist.columns else close.copy()
+    A squeeze occurs when BB width is narrower than 0.5 * ATR,
+    indicating volatility contraction before a potential breakout.
+    Returns True if squeeze is active, False if not, None if data missing.
+    """
+    if bb_lower is None or bb_upper is None or atr is None or atr <= 0:
+        return None
+    bb_width = bb_upper - bb_lower
+    return bb_width < (0.5 * atr)
 
-        atr = _compute_atr(highs, lows, close, period=14)
-        if atr <= 0:
-            continue
-
-        # ── Classify stock behaviour (6-month window) ────────────────
-        hurst = _hurst_exponent(close)
-        r_squared = _price_r_squared(close)
-        bb_cv = _bb_width_consistency(close)
-        cycle_period, cycle_consistency = _swing_point_intervals(highs, lows)
-        label, suitability = _classify_stock(
-            hurst, r_squared, bb_cv, cycle_period, cycle_consistency
-        )
-
-        # ── TradingView close for current price ──────────────────────
-        current_price = None
-        ta_entry = ta_cache.get(raw_ticker)
-        if ta_entry and ta_entry.ok:
-            tv_close = ta_entry.indicators.get("close")
-            if tv_close is not None and not pd.isna(tv_close):
-                current_price = float(tv_close)
-        if current_price is None:
-            current_price = float(close[-1])
-
-        # ══════════════════════════════════════════════════════════════
-        # METHOD A: Adaptive (classification-based, exponential decay)
-        # ══════════════════════════════════════════════════════════════
-        if suitability >= SWING_SUITABILITY_THRESHOLD:
-            if cycle_period >= SWING_MIN_CYCLE:
-                current_window = max(int(cycle_period * 2.5), SWING_RECENT_DEFAULT)
-            else:
-                current_window = SWING_RECENT_DEFAULT
-            current_window = min(current_window, len(close) - 5)
-
-            if current_window >= 8:
-                w_close = close[-current_window:]
-                w_highs = highs[-current_window:]
-                w_lows = lows[-current_window:]
-                tol = max(atr * SWING_CLUSTER_ATR_MULT, np.mean(w_close) * 0.015)
-
-                weights = _exponential_weights(current_window)
-                fh, fl = _find_weighted_extrema(w_highs, w_lows, weights, order=2)
-
-                rsup: List[float] = []
-                rres: List[float] = []
-                for win in [5, 10, current_window]:
-                    if len(w_close) >= win:
-                        rsup.append(float(w_lows[-win:].min()))
-                        rres.append(float(w_highs[-win:].max()))
-
-                all_sup = fl + rsup
-                all_res = fh + rres
-                med = float(np.median(w_close))
-                all_sup = [s for s in all_sup if abs(s - med) < 3 * atr]
-                all_res = [r for r in all_res if abs(r - med) < 3 * atr]
-
-                if len(all_sup) >= 2 and len(all_res) >= 2:
-                    sc = _cluster_levels(all_sup, tol)
-                    rc = _cluster_levels(all_res, tol)
-                    cs = [(a, c) for a, c in sc if c >= SWING_MIN_CURRENT_TESTS]
-                    cr = [(a, c) for a, c in rc if c >= SWING_MIN_CURRENT_TESTS]
-
-                    if cs and cr:
-                        bs, st = cs[0]
-                        br, rt = cr[0]
-                        if br > bs:
-                            rw = br - bs
-                            rm = (br + bs) / 2
-                            rwp = (rw / rm) * 100
-                            if SWING_MIN_WIDTH_PCT <= rwp <= SWING_MAX_WIDTH_PCT:
-                                crs = _count_midline_crossings(w_close, rm, current_window)
-                                if crs >= SWING_MIN_CROSSINGS:
-                                    pir = ((current_price - bs) / rw) * 100
-                                    pir = max(0.0, min(100.0, pir))
-                                    dlow = ((current_price - bs) / bs) * 100 if bs > 0 else 0
-                                    dhi = ((br - current_price) / current_price) * 100 if current_price > 0 else 0
-                                    stab = min(100, int(
-                                        suitability * 0.35 + crs * 10 + st * 8 + rt * 8 + cycle_consistency * 15
-                                    ))
-                                    if rwp > 15:
-                                        stab = int(stab * 0.7)
-                                    sc_score = int(
-                                        stab * 0.30 + suitability * 0.25 + crs * 8
-                                        + min(st, 5) * 5 + min(rt, 5) * 5 + cycle_consistency * 10
-                                    )
-                                    adaptive_results[raw_ticker] = {
-                                        "Ticker": raw_ticker,
-                                        "Current Price": round(current_price, 4),
-                                        "Range Low": round(bs, 4),
-                                        "Range Mid": round(rm, 4),
-                                        "Range High": round(br, 4),
-                                        "Range Width (%)": round(rwp, 2),
-                                        "Support Tests": st,
-                                        "Resistance Tests": rt,
-                                        "Range Cycles": crs,
-                                        "Range Stability": stab,
-                                        "Position in Range (%)": round(pir, 1),
-                                        "Distance to Low (%)": round(dlow, 2),
-                                        "Distance to High (%)": round(dhi, 2),
-                                        "Swing Entry": round(bs * 1.005, 4),
-                                        "Swing Target": round(rm, 4),
-                                        "Stop Loss": round(bs * 0.97, 4),
-                                        "Swing Score": sc_score,
-                                        "Classification": label,
-                                        "Hurst": round(hurst, 3),
-                                        "Cycle Period (days)": round(cycle_period, 1),
-                                        "Suitability": suitability,
-                                    }
-
-        # ══════════════════════════════════════════════════════════════
-        # METHOD B: Cluster (original approach — obvious S/R levels)
-        # ══════════════════════════════════════════════════════════════
-        # Runs regardless of classification. Catches stocks with clear
-        # support/resistance levels that may not pass statistical filters.
-        cluster_window = min(SWING_RECENT_DEFAULT + 5, len(close) - 5)
-        if cluster_window >= 8:
-            c_close = close[-cluster_window:]
-            c_highs = highs[-cluster_window:]
-            c_lows = lows[-cluster_window:]
-            c_tol = max(atr * SWING_CLUSTER_ATR_MULT, np.mean(c_close) * 0.015)
-
-            # Local minima/maxima on Close prices (original cluster method)
-            order = 2
-            c_sups: List[float] = []
-            c_res: List[float] = []
-            if len(c_close) >= 2 * order + 1:
-                for i in range(order, len(c_close) - order):
-                    w = c_close[i - order: i + order + 1]
-                    if c_close[i] == w.min():
-                        c_sups.append(float(c_close[i]))
-                    if c_close[i] == w.max():
-                        c_res.append(float(c_close[i]))
-            # Add fractal highs/lows on H/L arrays
-            fh2, fl2 = _find_fractal_levels(c_highs, c_lows, order=2)
-            c_sups.extend(fl2)
-            c_res.extend(fh2)
-
-            med2 = float(np.median(c_close))
-            c_sups = [s for s in c_sups if abs(s - med2) < 3 * atr]
-            c_res = [r for r in c_res if abs(r - med2) < 3 * atr]
-
-            if len(c_sups) >= 2 and len(c_res) >= 2:
-                csc = _cluster_levels(c_sups, c_tol)
-                crc = _cluster_levels(c_res, c_tol)
-                ccs = [(a, c) for a, c in csc if c >= SWING_MIN_CURRENT_TESTS]
-                ccr = [(a, c) for a, c in crc if c >= SWING_MIN_CURRENT_TESTS]
-
-                if ccs and ccr:
-                    cbs, cst = ccs[0]
-                    cbr, crt = ccr[0]
-                    if cbr > cbs:
-                        crw = cbr - cbs
-                        crm = (cbr + cbs) / 2
-                        crwp = (crw / crm) * 100
-                        if SWING_MIN_WIDTH_PCT <= crwp <= SWING_MAX_WIDTH_PCT:
-                            ccrs = _count_midline_crossings(c_close, crm, cluster_window)
-                            if ccrs >= SWING_MIN_CROSSINGS:
-                                cpir = ((current_price - cbs) / crw) * 100
-                                cpir = max(0.0, min(100.0, cpir))
-                                cdlow = ((current_price - cbs) / cbs) * 100 if cbs > 0 else 0
-                                cdhi = ((cbr - current_price) / current_price) * 100 if current_price > 0 else 0
-                                # Cluster method doesn't have statistical data — use basic scoring
-                                c_stab = min(100, int(ccrs * 12 + cst * 10 + crt * 10))
-                                if crwp > 15:
-                                    c_stab = int(c_stab * 0.7)
-                                c_score = int(c_stab * 0.40 + ccrs * 12 + min(cst, 5) * 5 + min(crt, 5) * 5)
-                                cluster_results[raw_ticker] = {
-                                    "Ticker": raw_ticker,
-                                    "Current Price": round(current_price, 4),
-                                    "Range Low": round(cbs, 4),
-                                    "Range Mid": round(crm, 4),
-                                    "Range High": round(cbr, 4),
-                                    "Range Width (%)": round(crwp, 2),
-                                    "Support Tests": cst,
-                                    "Resistance Tests": crt,
-                                    "Range Cycles": ccrs,
-                                    "Range Stability": c_stab,
-                                    "Position in Range (%)": round(cpir, 1),
-                                    "Distance to Low (%)": round(cdlow, 2),
-                                    "Distance to High (%)": round(cdhi, 2),
-                                    "Swing Entry": round(cbs * 1.005, 4),
-                                    "Swing Target": round(crm, 4),
-                                    "Stop Loss": round(cbs * 0.97, 4),
-                                    "Swing Score": c_score,
-                                    "Classification": "Cluster Match",
-                                    "Hurst": round(hurst, 3),
-                                    "Cycle Period (days)": round(cycle_period, 1),
-                                    "Suitability": suitability,
-                                }
-
-    # ── Merge: adaptive wins over cluster for same ticker ─────────────
-    merged: Dict[str, dict] = {}
-    merged.update(cluster_results)
-    for ticker, row in adaptive_results.items():
-        if ticker not in merged or row["Swing Score"] > merged[ticker]["Swing Score"]:
-            merged[ticker] = row
-
-    if not merged:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(list(merged.values()))
-    df.sort_values("Swing Score", ascending=False, inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
 
 
 # --------------------------------------------------------------------------
@@ -1944,6 +1482,11 @@ def run(input_path: str, output_path: str) -> None:
             macd = ind.get("MACD.macd")
             macd_signal = ind.get("MACD.signal")
             pe_ratio = ind.get("price_earnings_ttm")
+            adx = ind.get("ADX")
+            adx_plus = ind.get("ADX+DI")
+            adx_minus = ind.get("ADX-DI")
+            bb_lower = ind.get("BB.lower")
+            bb_upper = ind.get("BB.upper")
             ta_fetch_time = ta_entry.fetch_time.strftime("%Y-%m-%d %H:%M:%S") if ta_entry.fetch_time else None
         else:
             # Fallback: compute from yfinance
@@ -1960,6 +1503,11 @@ def run(input_path: str, output_path: str) -> None:
             macd = fallback["macd"]
             macd_signal = fallback["macd_signal"]
             pe_ratio = None  # No P/E fallback source (yfinance history has no earnings data)
+            adx = None
+            adx_plus = None
+            adx_minus = None
+            bb_lower = None
+            bb_upper = None
             ta_fetch_time = None
             ind = {}  # Empty indicators for fallback
 
@@ -1969,6 +1517,22 @@ def run(input_path: str, output_path: str) -> None:
         vol = volume_analysis(raw, yf_cache, ta_cache)  # Pass ta_cache for volume
         mf = money_flow_volume_analysis(raw, yf_cache)
         sr = support_resistance(raw, yf_cache)
+
+        # New indicators: ADL, MFI, BB Squeeze
+        adl = compute_adl(yf_entry.history)
+        mfi = compute_mfi(yf_entry.history)
+        atr_val = None
+        if "High" in yf_entry.history.columns and "Low" in yf_entry.history.columns:
+            h = yf_entry.history["High"].values.astype(float)
+            lo = yf_entry.history["Low"].values.astype(float)
+            c = yf_entry.history["Close"].values.astype(float)
+            if len(c) >= 2:
+                trs = []
+                for i in range(1, len(h)):
+                    tr = max(h[i] - lo[i], abs(h[i] - c[i-1]), abs(lo[i] - c[i-1]))
+                    trs.append(tr)
+                atr_val = float(np.array(trs[-14:]).mean()) if trs else None
+        bb_squeeze = compute_bb_squeeze(bb_lower, bb_upper, atr_val)
 
         # Prefer TradingView's close price - it's the freshest available price.
         # yfinance's OHLCV data can lag by up to a day depending on the data
@@ -2052,8 +1616,16 @@ def run(input_path: str, output_path: str) -> None:
             "MACD Signal": round(macd_signal, 4) if macd_signal is not None else None,
             "MACD Bullish (Yes/No)": macd_bullish,
             "RSI (%)": round(rsi, 2) if rsi is not None else None,
-            "VWMA": round(vwma, 4) if vwma is not None else None,  # New column for VWMA
-            "TA Data As Of": ta_fetch_time,  # New column for TA fetch time
+            "VWMA": round(vwma, 4) if vwma is not None else None,
+            "ADX": round(adx, 2) if adx is not None else None,
+            "ADX +DI": round(adx_plus, 2) if adx_plus is not None else None,
+            "ADX -DI": round(adx_minus, 2) if adx_minus is not None else None,
+            "BB Lower": round(bb_lower, 4) if bb_lower is not None else None,
+            "BB Upper": round(bb_upper, 4) if bb_upper is not None else None,
+            "BB Squeeze": "Yes" if bb_squeeze else ("No" if bb_squeeze is not None else None),
+            "ADL": round(adl, 0) if adl is not None else None,
+            "MFI": round(mfi, 2) if mfi is not None else None,
+            "TA Data As Of": ta_fetch_time,
             "Optimal Entry Price": rec["optimal_entry_price"],
             "Stop Loss": rec["stop_loss"],
             "Stop Loss Basis": rec["stop_loss_basis"],
@@ -2079,18 +1651,9 @@ def run(input_path: str, output_path: str) -> None:
     log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
     index_df = fetch_index_snapshot()
 
-    log.info("Detecting swing ranges...")
-    swing_df = detect_swing_range(yf_cache, ta_cache)
-    if not swing_df.empty:
-        log.info("Found %d stocks with swing range patterns", len(swing_df))
-    else:
-        log.info("No swing range patterns detected")
-
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name="Stock_Analysis", index=False)
         index_df.to_excel(writer, sheet_name="Indices", index=False)
-        if not swing_df.empty:
-            swing_df.to_excel(writer, sheet_name="Swing_Ranges", index=False)
 
     append_daily_history(out_df, output_path)
 

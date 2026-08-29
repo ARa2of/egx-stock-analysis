@@ -90,6 +90,7 @@ GEMINI_SUMMARY_COLUMNS = [
     "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
+    "ADX", "ADX+DI", "ADX-DI", "MFI", "BB Squeeze",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
     "Take Profit 1", "Take Profit 2", "Take Profit 3",
@@ -512,15 +513,7 @@ def read_history_data() -> Optional[pd.DataFrame]:
         logger.warning(f"Could not read history CSV: {e}")
         return None
 
-def read_swing_data() -> Optional[pd.DataFrame]:
-    """Read the Swing_Ranges sheet from the Excel file on GitHub."""
-    try:
-        response = requests.get(GITHUB_RAW_URL, timeout=10)
-        response.raise_for_status()
-        df = pd.read_excel(io.BytesIO(response.content), sheet_name="Swing_Ranges")
-        return df if df is not None and not df.empty else None
-    except Exception:
-        return None
+
 
 def format_github_history(ticker: str, limit: int = 30) -> str:
     """Format the last `limit` archived days for a ticker from the GitHub
@@ -789,7 +782,15 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • MACD Signal: {format_number(data.get('MACD Signal'), 4)}",
         f"  • {macd_emoji} MACD Bullish: {macd_bullish}",
         f"  • RSI: {format_number(data.get('RSI (%)'))}",
-        f"  • VWMA: {format_number(data.get('VWMA'))}",  # New VWMA line
+        f"  • VWMA: {format_number(data.get('VWMA'))}",
+        f"  • ADX: {format_number(data.get('ADX'))}",
+        f"  • ADX+DI: {format_number(data.get('ADX+DI'))}",
+        f"  • ADX-DI: {format_number(data.get('ADX-DI'))}",
+        f"  • BB Lower: {format_number(data.get('BB Lower'))}",
+        f"  • BB Upper: {format_number(data.get('BB Upper'))}",
+        f"  • BB Squeeze: {'✅ ON' if data.get('BB Squeeze') == 'ON' else '❌ OFF'}",
+        f"  • MFI: {format_number(data.get('MFI'))}",
+        f"  • ADL: {format_number(data.get('ADL'), 0)}",
         "",
         f"📊 *SUPPORT/RESISTANCE:*",
         f"  • Support: {format_number(data.get('Support'))}",
@@ -862,8 +863,6 @@ Hi {user.first_name}! I read your Excel analysis and provide stock recommendatio
 /show TICKER - Full analysis for a stock
 /list - All stocks grouped by recommendation
 /indices - EGX30/EGX70/EGX33 snapshot
-/swing TICKER - Detected swing range for a stock
-/listSw - All swing opportunities ranked
 /ask <question> - Ask AI about stocks
 /aireport - AI shortlist of strongest stocks
 /manage - Your portfolio (add holdings, get advice)
@@ -1382,116 +1381,6 @@ async def manage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show detected swing ranges for a ticker."""
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /swing TICKER\n"
-            "Example: /swing COMI"
-        )
-        return
-    ticker = context.args[0].upper()
-
-    df = read_swing_data()
-    if df is None or df.empty:
-        await update.message.reply_text(
-            "❌ Swing ranges not available yet.\n"
-            "Run the analysis first (python egx_stock_analysis.py), "
-            "then push the Excel to GitHub."
-        )
-        return
-
-    # Filter by ticker
-    tdf = df[df["Ticker"].str.upper() == ticker]
-    if tdf.empty:
-        # Show available tickers so user knows what exists
-        available = ", ".join(df["Ticker"].head(20).tolist())
-        await update.message.reply_text(
-            f"❌ No swing data for {ticker}.\n"
-            f"Available: {available}"
-        )
-        return
-
-    row = tdf.iloc[0]
-
-    def safe(val, fmt=".2f"):
-        if pd.isna(val):
-            return "N/A"
-        return f"{val:{fmt}}" if isinstance(val, (int, float)) else str(val)
-
-    score = safe(row.get("Swing Score"), ".0f")
-    pos = safe(row.get("Position in Range (%)"), ".0f")
-    stability = safe(row.get("Range Stability"), ".0f")
-
-    text = (
-        f"📈 *{ticker} Swing Analysis*\n"
-        f"{'=' * 28}\n\n"
-        f"*Classification:* {safe(row.get('Classification'))}\n"
-        f"*Suitability:* {safe(row.get('Suitability'), '.0f')}/100\n"
-        f"*Hurst:* {safe(row.get('Hurst'), '.3f')}\n"
-        f"*Typical Cycle:* {safe(row.get('Cycle Period (days)'), '.0f')} days\n\n"
-        f"*Current Price:* {safe(row.get('Current Price'))}\n\n"
-        f"*Range Levels:*\n"
-        f"  Support (Low): {safe(row.get('Range Low'))}\n"
-        f"  Mid: {safe(row.get('Range Mid'))}\n"
-        f"  Resistance (High): {safe(row.get('Range High'))}\n"
-        f"  Width: {safe(row.get('Range Width (%)'))}%\n\n"
-        f"*Testing & Stability:*\n"
-        f"  Support Tests: {safe(row.get('Support Tests'), '.0f')}\n"
-        f"  Resistance Tests: {safe(row.get('Resistance Tests'), '.0f')}\n"
-        f"  Completed Cycles: {safe(row.get('Range Cycles'), '.0f')}\n"
-        f"  Stability: {stability}/100\n\n"
-        f"*Position & Potential:*\n"
-        f"  Position in Range: {pos}%\n"
-        f"  Distance to Low: {safe(row.get('Distance to Low (%)'))}%\n"
-        f"  Distance to High: {safe(row.get('Distance to High (%)'))}%\n\n"
-        f"*Trade Setup:*\n"
-        f"  Entry: {safe(row.get('Swing Entry'))}\n"
-        f"  Target: {safe(row.get('Swing Target'))}\n"
-        f"  Stop Loss: {safe(row.get('Stop Loss'))}\n\n"
-        f"*Swing Score:* {score}/100"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def listsw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all swing opportunities ranked by Swing Score."""
-    df = read_swing_data()
-    if df is None or df.empty:
-        await update.message.reply_text(
-            "❌ Swing ranges not available yet.\n"
-            "Run the analysis first (python egx_stock_analysis.py), "
-            "then push the Excel to GitHub."
-        )
-        return
-
-    df = df.sort_values("Swing Score", ascending=False).reset_index(drop=True)
-
-    lines = ["📈 *EGX Swing Opportunities*\n"]
-
-    for i, (_, row) in enumerate(df.iterrows(), 1):
-        ticker = row.get("Ticker", "?")
-        score = row.get("Swing Score", 0)
-        low = row.get("Range Low", 0)
-        high = row.get("Range High", 0)
-        current = row.get("Current Price", 0)
-        pos = row.get("Position in Range (%)", 0)
-
-        def safe(v, fmt=".2f"):
-            if pd.isna(v):
-                return "N/A"
-            return f"{v:{fmt}}" if isinstance(v, (int, float)) else str(v)
-
-        lines.append(
-            f"{i}. *{ticker}* — {safe(row.get('Classification'))} — "
-            f"Score: {safe(score, '.0f')} — "
-            f"Range: {safe(low)}–{safe(high)} — Current: {safe(current)} — "
-            f"Pos: {safe(pos, '.0f')}%"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unknown commands."""
     await update.message.reply_text(
@@ -1506,9 +1395,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Analysis:</b>\n"
         "/show TICKER — Full analysis for one stock\n"
         "/list — All stocks grouped by recommendation\n"
-        "/indices — EGX30/EGX70/EGX33 index snapshot\n"
-        "/swing TICKER — Detected swing range (support/resistance)\n"
-        "/listSw — All swing opportunities ranked by score\n\n"
+        "/indices — EGX30/EGX70/EGX33 index snapshot\n\n"
         "<b>AI:</b>\n"
         "/ask &lt;question&gt; — Ask about any stock(s)\n"
         "  /ask how does COMI look?\n"
@@ -1583,8 +1470,6 @@ def main():
     application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("aireport", ai_report_command))
     application.add_handler(CommandHandler("manage", manage_command))
-    application.add_handler(CommandHandler("swing", swing_command))
-    application.add_handler(CommandHandler("listSw", listsw_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_callback))
