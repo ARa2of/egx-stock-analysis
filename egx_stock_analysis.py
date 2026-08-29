@@ -1432,7 +1432,15 @@ def build_enhanced_recommendation_and_entry(
     if is_distributing and regime != "bullish":
         bear_score += 1
 
-    # ChartScanAI cross-validation scoring
+    # BB Squeeze neutral (noted but doesn't shift score)
+
+    # ChartScanAI cross-validation (define flags first, then score, then reasons)
+    cs_agrees_buy = cs_signal == "Buy"
+    cs_agrees_sell = cs_signal == "Sell"
+    cs_conflict_buy = cs_agrees_sell and regime == "bullish"
+    cs_conflict_sell = cs_agrees_buy and regime == "bearish"
+
+    # ChartScanAI scoring
     if cs_agrees_buy and regime == "bullish":
         bull_score += 2  # strong confirmation
     elif cs_agrees_buy:
@@ -1446,13 +1454,7 @@ def build_enhanced_recommendation_and_entry(
     if cs_conflict_sell:
         bull_score -= 1  # conflict reduces confidence
 
-    # BB Squeeze neutral (noted but doesn't shift score)
-
-    # ChartScanAI cross-validation
-    cs_agrees_buy = cs_signal == "Buy"
-    cs_agrees_sell = cs_signal == "Sell"
-    cs_conflict_buy = cs_agrees_sell and regime == "bullish"
-    cs_conflict_sell = cs_agrees_buy and regime == "bearish"
+    # ChartScanAI reasons
     if cs_agrees_buy:
         reasons.append("ChartScanAI confirms Buy")
     if cs_agrees_sell:
