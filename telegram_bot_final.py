@@ -756,7 +756,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
         "",
         f"{emoji} *RECOMMENDATION:* {rec}",
-        f"📝 *Basis:* {data.get('Recommendation Basis', 'N/A')[:150]}...",
+        f"📝 *Basis:* {data.get('Recommendation Basis', 'N/A')}",
         "",
         f"💰 *PRICES:*",
         f"  • EGP: {format_number(data.get('Current EGP Price'))}",
@@ -807,7 +807,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🎯 *TRADE SETUP:*",
         f"  • Entry: {format_number(data.get('Optimal Entry Price'))}",
         f"  • Stop Loss: {format_number(data.get('Stop Loss'))}",
-        f"  • Stop Basis: {data.get('Stop Loss Basis', 'N/A')[:80]}...",
+        f"  • Stop Basis: {data.get('Stop Loss Basis', 'N/A')}",
         "",
         f"🏆 *TAKE PROFIT TARGETS:*",
     ]
@@ -834,7 +834,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         lines.append(f"  • TP3: {format_number(tp3)}  | RR: {format_number(tp3_rr)}x  | +{format_number(tp3_pct)}%")
     
     if tp1 and not pd.isna(tp1):
-        lines.append(f"  📝 TP Basis: {data.get('Take Profit Basis', 'N/A')[:100]}...")
+        lines.append(f"  📝 TP Basis: {data.get('Take Profit Basis', 'N/A')}")
     
     # Add market links
     ticker = data.get('Selected Stock', '')
