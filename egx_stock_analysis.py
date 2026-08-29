@@ -1313,6 +1313,8 @@ def build_enhanced_recommendation_and_entry(
     mfi: Optional[float] = None,
     adl: Optional[float] = None,
     bb_squeeze: Optional[bool] = None,
+    vwma: Optional[float] = None,
+    macd_bullish: Optional[str] = None,
 ) -> dict:
     """
     Enhanced recommendation with better entry price using TradingView indicators.
@@ -1346,7 +1348,11 @@ def build_enhanced_recommendation_and_entry(
     overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
     oversold = rsi is not None and rsi <= RSI_OVERSOLD
 
-    # === TREND REGIME (only Golden/Death Cross — ADX confirms but does NOT override) ===
+    # VWMA and MACD Bullish signals
+    price_above_vwma = current_price is not None and vwma is not None and current_price >= vwma
+    is_macd_bullish = macd_bullish == "Yes"
+
+    # === TREND REGIME (only Golden/Death Cross) ===
     if golden_cross == "Yes":
         regime = "bullish"
     elif death_cross == "Yes":
@@ -1354,79 +1360,74 @@ def build_enhanced_recommendation_and_entry(
     else:
         regime = "unknown"
 
-    # === WEIGHTED SCORING (industry-based weights) ===
-    # Tier 1 - Trend (primary): Golden/Death Cross carry the most weight
-    # Tier 2 - Momentum: Diamond Cross, RSI/MFI conditions
-    # Tier 3 - Volume/Support: volume spike, near support, ADL
-    bull_score = 0
-    bear_score = 0
+    # === WEIGHTED SCORING ===
+    # Designed so max possible score ~ 8-9, min ~ -5
+    # Percentiles will determine final recommendation
+    score = 0.0
 
-    # --- Tier 1: Trend confirmation ---
+    # --- Trend ---
     if regime == "bullish":
-        bull_score += 3
+        score += 1.0
         reasons.append("Golden Cross confirmed")
     elif regime == "bearish":
-        bear_score += 4
+        score -= 2.0
         reasons.append("Death Cross (confirmed downtrend)")
-    elif has_strong_trend and adx_bullish_dir:
-        # ADX can hint at direction but carries less weight than a cross
-        bull_score += 1
-        reasons.append("ADX suggests uptrend (no cross yet)")
-    elif has_strong_trend and adx_bearish_dir:
-        bear_score += 1
-        reasons.append("ADX suggests downtrend (no cross yet)")
 
-    # --- Tier 2: Momentum confirmation ---
+    # --- Price vs Support ---
+    if is_near_support:
+        score += 1.5
+        reasons.append("near support")
+
+    # --- Price vs VWMA ---
+    if price_above_vwma:
+        score += 0.5
+        reasons.append("price >= VWMA")
+
+    # --- MACD ---
+    if is_macd_bullish:
+        score += 0.5
+        reasons.append("MACD bullish")
+
+    # --- Diamond Cross ---
     if has_diamond:
-        bull_score += 1
+        score += 1.0
         reasons.append("Diamond Cross (EMA20>EMA50)")
+
+    # --- RSI ---
     if overbought:
-        bear_score += 2
+        score -= 2.0
         reasons.append(f"RSI overbought ({rsi:.1f})")
     elif oversold:
-        bull_score += 1
+        score += 1.0
         reasons.append(f"RSI oversold ({rsi:.1f})")
+
+    # --- MFI ---
     if is_mfi_overbought:
-        bear_score += 1
+        score -= 1.0
         reasons.append(f"MFI overbought ({mfi:.1f})")
     elif is_mfi_oversold and regime != "bearish":
-        bull_score += 1
+        score += 1.0
         reasons.append(f"MFI oversold ({mfi:.1f})")
 
-    # --- Tier 3: Volume / Support ---
+    # --- Volume ---
     if is_volume_spike:
-        bull_score += 1
-    if is_near_support:
-        bull_score += 1
-    if is_accumulating:
-        bull_score += 1
-        reasons.append("ADL positive (accumulation)")
-    if is_distributing:
-        bear_score += 1
-        reasons.append("ADL negative (distribution)")
+        score += 1.0
 
-    # === RECOMMENDATION DECISION ===
-    # Buy requires: bullish regime (Golden Cross) + score >= 5
-    # This ensures at least 2 confirmations beyond the trend signal
-    if regime == "bearish":
-        recommendation = "Avoid"
-    elif overbought:
-        recommendation = "Watch"
-        reasons.append("RSI overbought — wait for pullback")
-    elif regime == "bullish" and bull_score >= 5:
-        recommendation = "Buy"
-    elif regime == "bullish" and bull_score >= 3:
-        recommendation = "Watch"
-    elif regime == "bullish":
-        recommendation = "Hold"
-    elif regime == "unknown" and bull_score >= 4:
-        # Unknown regime needs higher bar
-        recommendation = "Watch"
-    elif oversold and regime != "bearish":
-        recommendation = "Watch"
-        reasons.append("oversold — possible reversal setup")
-    else:
-        recommendation = "Hold"
+    # --- ADL ---
+    if is_accumulating:
+        score += 1.0
+        reasons.append("accumulation (ADL positive)")
+    elif is_distributing:
+        score -= 1.0
+        reasons.append("distribution (ADL negative)")
+
+    # Store raw score for percentile ranking
+    raw_score = score
+
+    # === RECOMMENDATION (will be overridden by percentile post-processing) ===
+    # Placeholder — actual recommendation assigned after all stocks scored
+    recommendation = "Hold"
+    basis = ", ".join(reasons) if reasons else "no signals triggered"
 
     # === ENTRY PRICE ===
     if USE_ENHANCED_ENTRY and ind and len(ind) > 0:
@@ -1495,6 +1496,7 @@ def build_enhanced_recommendation_and_entry(
     return {
         "recommendation": recommendation,
         "recommendation_basis": basis,
+        "raw_score": round(raw_score, 2),
         "optimal_entry_price": round(entry_price, 4) if entry_price is not None else None,
         "stop_loss": round(stop_loss, 4) if stop_loss is not None else None,
         "stop_loss_basis": stop_loss_basis,
@@ -1764,6 +1766,7 @@ def run(input_path: str, output_path: str) -> None:
             diamond_cross,
             adx, adx_plus, adx_minus,
             mfi, adl, bb_squeeze,
+            vwma, macd_bullish,
         )
 
         rows.append({
@@ -1837,6 +1840,36 @@ def run(input_path: str, output_path: str) -> None:
         raise RuntimeError("No valid tickers to output; check logs.")
 
     out_df = pd.DataFrame(rows)
+
+    # === PERCENTILE-BASED RECOMMENDATION ===
+    # Compute percentiles and assign Buy/Watch/Avoid based on score distribution
+    if "raw_score" in out_df.columns and len(out_df) > 1:
+        scores = out_df["raw_score"]
+        p70 = scores.quantile(0.70)
+        p45 = scores.quantile(0.45)
+
+        def _assign_rec(row):
+            # Death Cross always Avoid regardless of score
+            if row.get("Death Cross (Yes/No)") == "Yes":
+                return "Avoid"
+            s = row["raw_score"]
+            if s >= p70:
+                return "Buy"
+            elif s >= p45:
+                return "Watch"
+            else:
+                return "Avoid"
+
+        out_df["Recommendation"] = out_df.apply(_assign_rec, axis=1)
+
+        # Update basis to include score info
+        for i, row in out_df.iterrows():
+            old_basis = row.get("Recommendation Basis", "")
+            score_info = f"score={row['raw_score']:.1f} (p70={p70:.1f}, p45={p45:.1f})"
+            out_df.at[i, "Recommendation Basis"] = f"{old_basis}; {score_info}"
+
+        log.info("Percentile recommendations: p70=%.2f, p45=%.2f", p70, p45)
+        log.info("Recommendations: %s", out_df["Recommendation"].value_counts().to_dict())
 
     log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
     index_df = fetch_index_snapshot()

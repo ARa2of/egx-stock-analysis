@@ -787,19 +787,8 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • 200 EMA: {format_number(data.get('200 EMA'))}",
         f"  • {ema_emoji} EMA Bullish (50>200): {ema_bullish}",
         f"  • {diamond_emoji} Diamond Cross (20>50): {diamond_cross}",
-        f"  • MACD: {format_number(data.get('MACD'), 4)}",
-        f"  • MACD Signal: {format_number(data.get('MACD Signal'), 4)}",
-        f"  • {macd_emoji} MACD Bullish: {macd_bullish}",
         f"  • RSI: {format_number(data.get('RSI (%)'))}",
-        f"  • VWMA: {format_number(data.get('VWMA'))}",
-        f"  • ADX: {format_number(data.get('ADX'))}",
-        f"  • ADX+DI: {format_number(data.get('ADX +DI'))}",
-        f"  • ADX-DI: {format_number(data.get('ADX -DI'))}",
-        f"  • BB Lower: {format_number(data.get('BB Lower'))}",
-        f"  • BB Upper: {format_number(data.get('BB Upper'))}",
-        f"  • BB Squeeze: {'✅ ON' if data.get('BB Squeeze') == 'ON' else '❌ OFF'}",
-        f"  • MFI: {format_number(data.get('MFI'))}",
-        f"  • ADL: {format_number(data.get('ADL'), 0)}",
+        f"  • {'📈 Accumulation' if (data.get('ADL') or 0) > 0 else '📉 Distribution' if (data.get('ADL') or 0) < 0 else '— ADL: N/A'}",
         "",
         f"🤖 *CHARTSCAN AI:*",
         f"  • Recommendation: {'🟢 Buy' if data.get('ChartScanAI Recommendation') == 'Buy' else '🔴 Avoid' if data.get('ChartScanAI Recommendation') == 'Avoid' else '🔵 Hold' if data.get('ChartScanAI Recommendation') == 'Hold' else 'N/A'}",
@@ -929,17 +918,18 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     strong_buy = df[
         (df["Recommendation"] == "Buy") & 
         (df["ChartScanAI Recommendation"] == "Buy")
-    ]
+    ].sort_values("ChartScanAI Confidence", ascending=False)
     if not strong_buy.empty:
         lines.append(f"🔥 *STRONG BUY* ({len(strong_buy)}) — Both methods agree")
         for _, row in strong_buy.iterrows():
             ticker = row["Selected Stock"]
             price = row.get("Current EGP Price")
             price_str = format_number(price) if price else "N/A"
-            lines.append(f"  • {ticker} @ {price_str} EGP ✅🤖")
+            conf = row.get("ChartScanAI Confidence", 0) or 0
+            lines.append(f"  • {ticker} @ {price_str} EGP (🤖 {conf:.0%})")
         lines.append("")
     
-    # Group by recommendation (excluding Strong Buy duplicates)
+    # Group by recommendation (excluding Strong Buy from Buy section)
     for rec in ["Buy", "Watch", "Hold", "Avoid"]:
         rec_df = df[df["Recommendation"] == rec]
         if not rec_df.empty:
@@ -950,11 +940,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 price = row.get("Current EGP Price")
                 price_str = format_number(price) if price else "N/A"
                 diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
-                # ChartScanAI comparison
                 cs_rec = row.get("ChartScanAI Recommendation", "")
                 is_strong = (rec == "Buy" and cs_rec == "Buy")
                 if is_strong:
-                    cs_mark = " ✅🤖"  # already shown in Strong Buy but mark here too
+                    cs_mark = ""  # already shown in Strong Buy section
                 elif cs_rec == rec:
                     cs_mark = " ✅🤖"
                 elif cs_rec and cs_rec != rec and cs_rec in ("Buy", "Avoid"):
