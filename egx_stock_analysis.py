@@ -1829,6 +1829,7 @@ def run(input_path: str, output_path: str) -> None:
             "TP3 Reward %": rec["tp3_reward_pct"],
             "Recommendation": rec["recommendation"],
             "Recommendation Basis": rec["recommendation_basis"],
+            "Score": rec["raw_score"],
             "ChartScanAI Signal": cs_signal,
             "ChartScanAI Recommendation": cs_recommendation,
             "ChartScanAI Confidence": round(cs_confidence, 4) if cs_confidence is not None else None,
