@@ -925,7 +925,21 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Create formatted list with recommendations
     lines = ["📋 *PORTFOLIO SUMMARY*", "=" * 30, ""]
     
-    # Group by recommendation
+    # Strong Buy: both indicators AND ChartScanAI say Buy
+    strong_buy = df[
+        (df["Recommendation"] == "Buy") & 
+        (df["ChartScanAI Recommendation"] == "Buy")
+    ]
+    if not strong_buy.empty:
+        lines.append(f"🔥 *STRONG BUY* ({len(strong_buy)}) — Both methods agree")
+        for _, row in strong_buy.iterrows():
+            ticker = row["Selected Stock"]
+            price = row.get("Current EGP Price")
+            price_str = format_number(price) if price else "N/A"
+            lines.append(f"  • {ticker} @ {price_str} EGP ✅🤖")
+        lines.append("")
+    
+    # Group by recommendation (excluding Strong Buy duplicates)
     for rec in ["Buy", "Watch", "Hold", "Avoid"]:
         rec_df = df[df["Recommendation"] == rec]
         if not rec_df.empty:
@@ -935,22 +949,25 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ticker = row["Selected Stock"]
                 price = row.get("Current EGP Price")
                 price_str = format_number(price) if price else "N/A"
-                undervalued = "💎" if row.get("Undervalued (Yes/No)") == "Yes" else ""
                 diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
                 # ChartScanAI comparison
                 cs_rec = row.get("ChartScanAI Recommendation", "")
-                if cs_rec == rec:
+                is_strong = (rec == "Buy" and cs_rec == "Buy")
+                if is_strong:
+                    cs_mark = " ✅🤖"  # already shown in Strong Buy but mark here too
+                elif cs_rec == rec:
                     cs_mark = " ✅🤖"
                 elif cs_rec and cs_rec != rec and cs_rec in ("Buy", "Avoid"):
                     cs_mark = " ⚠️🤖"
                 else:
                     cs_mark = ""
-                lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}{diamond}{cs_mark}")
+                lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{cs_mark}")
             lines.append("")
     
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
-    lines.append("🤖 ChartScanAI: ✅=both agree | ⚠️=conflict")
+    lines.append("🔥 Strong Buy = both indicators + ChartScanAI agree")
+    lines.append("🤖 ✅=agree | ⚠️=conflict")
     
     # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()

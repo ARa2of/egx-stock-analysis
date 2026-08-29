@@ -1334,140 +1334,99 @@ def build_enhanced_recommendation_and_entry(
     if is_near_support:
         reasons.append("near support")
 
-    signal_count = sum([is_volume_spike, is_near_support])
-
-    # === NEW INDICATOR SIGNALS ===
-    # ADX: trend strength
+    # === INDICATOR SIGNALS ===
     has_strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
-    if has_strong_trend:
-        reasons.append(f"ADX {adx:.1f} (strong trend)")
-
-    # ADX+DI vs ADX-DI: direction confirmation
     adx_bullish_dir = adx_plus is not None and adx_minus is not None and adx_plus > adx_minus
     adx_bearish_dir = adx_plus is not None and adx_minus is not None and adx_minus > adx_plus
-    if adx_bullish_dir:
-        reasons.append("ADX+DI > ADX-DI (bullish direction)")
-    elif adx_bearish_dir:
-        reasons.append("ADX-DI > ADX+DI (bearish direction)")
-
-    # MFI: money flow
     is_mfi_overbought = mfi is not None and mfi >= MFI_OVERBOUGHT
     is_mfi_oversold = mfi is not None and mfi <= MFI_OVERSOLD
-    if is_mfi_overbought:
-        reasons.append(f"MFI {mfi:.1f} (overbought)")
-    if is_mfi_oversold:
-        reasons.append(f"MFI {mfi:.1f} (oversold)")
+    is_accumulating = adl is not None and adl > 0
+    is_distributing = adl is not None and adl < 0
+    has_diamond = diamond_cross == "Yes"
+    overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
+    oversold = rsi is not None and rsi <= RSI_OVERSOLD
 
-    # ADL: accumulation/distribution (cumulative line; positive = net accumulation)
-    is_accumulating = False
-    is_distributing = False
-    if adl is not None:
-        is_accumulating = adl > 0
-        is_distributing = adl < 0
-    if is_accumulating:
-        reasons.append("ADL positive (accumulation)")
-    elif is_distributing:
-        reasons.append("ADL negative (distribution)")
-
-    # BB Squeeze: volatility compression
-    if bb_squeeze is True:
-        reasons.append("BB Squeeze ON (volatility compression)")
-
-    # === DETERMINE TREND REGIME ===
-    # Use ADX direction to reinforce/override Golden/Death Cross
+    # === TREND REGIME (only Golden/Death Cross — ADX confirms but does NOT override) ===
     if golden_cross == "Yes":
         regime = "bullish"
     elif death_cross == "Yes":
         regime = "bearish"
-    elif adx_bullish_dir and has_strong_trend:
-        regime = "bullish"  # ADX confirms bullish even without golden cross
-    elif adx_bearish_dir and has_strong_trend:
-        regime = "bearish"  # ADX confirms bearish even without death cross
     else:
         regime = "unknown"
 
-    # === SCORING SYSTEM ===
-    # Positive signals add, negative signals subtract
+    # === WEIGHTED SCORING (industry-based weights) ===
+    # Tier 1 - Trend (primary): Golden/Death Cross carry the most weight
+    # Tier 2 - Momentum: Diamond Cross, RSI/MFI conditions
+    # Tier 3 - Volume/Support: volume spike, near support, ADL
     bull_score = 0
     bear_score = 0
 
-    # Base signals
-    bull_score += signal_count  # undervalued, volume spike, near support
-
-    # Trend confirmation
+    # --- Tier 1: Trend confirmation ---
     if regime == "bullish":
-        bull_score += 2
-        reasons.append("Golden Cross confirmed" if golden_cross == "Yes" else "ADX confirms uptrend")
+        bull_score += 3
+        reasons.append("Golden Cross confirmed")
     elif regime == "bearish":
-        bear_score += 3
-        reasons.append("Death Cross (confirmed downtrend)" if death_cross == "Yes" else "ADX confirms downtrend")
+        bear_score += 4
+        reasons.append("Death Cross (confirmed downtrend)")
+    elif has_strong_trend and adx_bullish_dir:
+        # ADX can hint at direction but carries less weight than a cross
+        bull_score += 1
+        reasons.append("ADX suggests uptrend (no cross yet)")
+    elif has_strong_trend and adx_bearish_dir:
+        bear_score += 1
+        reasons.append("ADX suggests downtrend (no cross yet)")
 
-    # Diamond Cross
-    has_diamond = diamond_cross == "Yes"
+    # --- Tier 2: Momentum confirmation ---
     if has_diamond:
         bull_score += 1
         reasons.append("Diamond Cross (EMA20>EMA50)")
-
-    # ADX strength bonus
-    if has_strong_trend:
-        if adx_bullish_dir:
-            bull_score += 1
-        elif adx_bearish_dir:
-            bear_score += 1
-
-    # Money flow
-    if is_mfi_oversold and regime != "bearish":
-        bull_score += 1  # oversold in non-bearish = potential bounce
+    if overbought:
+        bear_score += 2
+        reasons.append(f"RSI overbought ({rsi:.1f})")
+    elif oversold:
+        bull_score += 1
+        reasons.append(f"RSI oversold ({rsi:.1f})")
     if is_mfi_overbought:
         bear_score += 1
-
-    # Accumulation/Distribution
-    if is_accumulating and regime == "bullish":
+        reasons.append(f"MFI overbought ({mfi:.1f})")
+    elif is_mfi_oversold and regime != "bearish":
         bull_score += 1
-    if is_distributing and regime != "bullish":
-        bear_score += 1
+        reasons.append(f"MFI oversold ({mfi:.1f})")
 
-    # BB Squeeze neutral (noted but doesn't shift score)
+    # --- Tier 3: Volume / Support ---
+    if is_volume_spike:
+        bull_score += 1
+    if is_near_support:
+        bull_score += 1
+    if is_accumulating:
+        bull_score += 1
+        reasons.append("ADL positive (accumulation)")
+    if is_distributing:
+        bear_score += 1
+        reasons.append("ADL negative (distribution)")
 
     # === RECOMMENDATION DECISION ===
-    overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
-    if overbought:
-        reasons.append(f"RSI overbought ({rsi:.1f})")
-    oversold = rsi is not None and rsi <= RSI_OVERSOLD
-    if oversold:
-        reasons.append(f"RSI oversold ({rsi:.1f})")
-
-    if regime == "bearish" and bear_score >= 3:
+    # Buy requires: bullish regime (Golden Cross) + score >= 5
+    # This ensures at least 2 confirmations beyond the trend signal
+    if regime == "bearish":
         recommendation = "Avoid"
-    elif regime == "bearish" and bear_score < 3:
-        # Bearish regime but weak signals → Watch (possible reversal)
-        recommendation = "Watch" if is_mfi_oversold or oversold else "Hold"
-        if recommendation == "Watch":
-            reasons.append("weak bearish + oversold → possible reversal")
     elif overbought:
         recommendation = "Watch"
-    elif regime == "bullish":
-        if signal_count >= 2 and bull_score >= 4:
-            recommendation = "Buy"
-        elif signal_count >= 1 and bull_score >= 3:
-            recommendation = "Buy" if has_diamond else "Watch"
-        elif bull_score >= 3:
-            recommendation = "Watch"
-        else:
-            recommendation = "Hold"
-    else:  # unknown
-        if bull_score >= 4:
-            recommendation = "Buy"
-        elif bull_score >= 3:
-            recommendation = "Watch"
-        else:
-            recommendation = "Hold"
-
-    # Upgrade: strong ADX + accumulation in uptrend → Buy
-    if (recommendation == "Watch" and has_strong_trend and adx_bullish_dir
-            and is_accumulating and regime == "bullish"):
+        reasons.append("RSI overbought — wait for pullback")
+    elif regime == "bullish" and bull_score >= 5:
         recommendation = "Buy"
-        reasons.append("ADX + accumulation upgrade to Buy")
+    elif regime == "bullish" and bull_score >= 3:
+        recommendation = "Watch"
+    elif regime == "bullish":
+        recommendation = "Hold"
+    elif regime == "unknown" and bull_score >= 4:
+        # Unknown regime needs higher bar
+        recommendation = "Watch"
+    elif oversold and regime != "bearish":
+        recommendation = "Watch"
+        reasons.append("oversold — possible reversal setup")
+    else:
+        recommendation = "Hold"
 
     # === ENTRY PRICE ===
     if USE_ENHANCED_ENTRY and ind and len(ind) > 0:
