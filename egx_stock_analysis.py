@@ -1313,7 +1313,6 @@ def build_enhanced_recommendation_and_entry(
     mfi: Optional[float] = None,
     adl: Optional[float] = None,
     bb_squeeze: Optional[bool] = None,
-    cs_signal: Optional[str] = None,
 ) -> dict:
     """
     Enhanced recommendation with better entry price using TradingView indicators.
@@ -1433,36 +1432,6 @@ def build_enhanced_recommendation_and_entry(
         bear_score += 1
 
     # BB Squeeze neutral (noted but doesn't shift score)
-
-    # ChartScanAI cross-validation (define flags first, then score, then reasons)
-    cs_agrees_buy = cs_signal == "Buy"
-    cs_agrees_sell = cs_signal == "Sell"
-    cs_conflict_buy = cs_agrees_sell and regime == "bullish"
-    cs_conflict_sell = cs_agrees_buy and regime == "bearish"
-
-    # ChartScanAI scoring
-    if cs_agrees_buy and regime == "bullish":
-        bull_score += 2  # strong confirmation
-    elif cs_agrees_buy:
-        bull_score += 1  # possible early signal
-    if cs_agrees_sell and regime == "bearish":
-        bear_score += 2  # strong confirmation
-    elif cs_agrees_sell:
-        bear_score += 1
-    if cs_conflict_buy:
-        bear_score += 1  # conflict reduces confidence
-    if cs_conflict_sell:
-        bull_score -= 1  # conflict reduces confidence
-
-    # ChartScanAI reasons
-    if cs_agrees_buy:
-        reasons.append("ChartScanAI confirms Buy")
-    if cs_agrees_sell:
-        reasons.append("ChartScanAI confirms Sell")
-    if cs_conflict_buy:
-        reasons.append("ChartScanAI conflicts (says Sell in uptrend)")
-    if cs_conflict_sell:
-        reasons.append("ChartScanAI conflicts (says Buy in downtrend)")
 
     # === RECOMMENDATION DECISION ===
     overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
@@ -1599,7 +1568,7 @@ HISTORY_COLUMNS = [
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze", "ADL",
-    "ChartScanAI Signal", "ChartScanAI Confidence",
+    "ChartScanAI Signal", "ChartScanAI Recommendation", "ChartScanAI Confidence",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance",
     "P/E Ratio (TTM)", "EPS (TTM)",
@@ -1821,6 +1790,16 @@ def run(input_path: str, output_path: str) -> None:
         cs_buy_patterns = cs_result["buy_patterns"] if cs_result else None
         cs_sell_patterns = cs_result["sell_patterns"] if cs_result else None
 
+        # ChartScanAI maps its own Buy/Sell to a recommendation
+        if cs_signal == "Buy":
+            cs_recommendation = "Buy"
+        elif cs_signal == "Sell":
+            cs_recommendation = "Avoid"
+        elif cs_signal == "Neutral":
+            cs_recommendation = "Hold"
+        else:
+            cs_recommendation = None
+
         # Enhanced Recommendation & Entry
         rec = build_enhanced_recommendation_and_entry(
             val, mf, sr, ind, current_price,
@@ -1830,7 +1809,6 @@ def run(input_path: str, output_path: str) -> None:
             diamond_cross,
             adx, adx_plus, adx_minus,
             mfi, adl, bb_squeeze,
-            cs_signal,
         )
 
         rows.append({
@@ -1894,6 +1872,7 @@ def run(input_path: str, output_path: str) -> None:
             "Recommendation": rec["recommendation"],
             "Recommendation Basis": rec["recommendation_basis"],
             "ChartScanAI Signal": cs_signal,
+            "ChartScanAI Recommendation": cs_recommendation,
             "ChartScanAI Confidence": round(cs_confidence, 4) if cs_confidence is not None else None,
             "ChartScanAI Buy Patterns": cs_buy_patterns,
             "ChartScanAI Sell Patterns": cs_sell_patterns,

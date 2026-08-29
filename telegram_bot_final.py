@@ -91,7 +91,7 @@ GEMINI_SUMMARY_COLUMNS = [
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
     "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze",
-    "ChartScanAI Signal", "ChartScanAI Confidence",
+    "ChartScanAI Signal", "ChartScanAI Recommendation", "ChartScanAI Confidence",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance", "Optimal Entry Price", "Stop Loss",
     "Take Profit 1", "Take Profit 2", "Take Profit 3",
@@ -551,6 +551,14 @@ def get_all_tickers() -> list:
         return []
     return df["Selected Stock"].tolist()
 
+def _escape_md(text: str) -> str:
+    """Escape Markdown special characters for Telegram MarkdownV1."""
+    if not text:
+        return text
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 def format_number(val, decimals=2):
     """Format a number for display."""
     if val is None or pd.isna(val):
@@ -757,7 +765,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
         "",
         f"{emoji} *RECOMMENDATION:* {rec}",
-        f"📝 *Basis:* {data.get('Recommendation Basis', 'N/A')}",
+        f"📝 *Basis:* {_escape_md(data.get('Recommendation Basis', 'N/A'))}",
         "",
         f"💰 *PRICES:*",
         f"  • EGP: {format_number(data.get('Current EGP Price'))}",
@@ -794,9 +802,10 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"  • ADL: {format_number(data.get('ADL'), 0)}",
         "",
         f"🤖 *CHARTSCAN AI:*",
-        f"  • Signal: {'🟢 Buy' if data.get('ChartScanAI Signal') == 'Buy' else '🔴 Sell' if data.get('ChartScanAI Signal') == 'Sell' else '⚪ Neutral'}",
-        f"  • Confidence: {format_number(data.get('ChartScanAI Confidence'), '.0%') if data.get('ChartScanAI Confidence') is not None else 'N/A'}",
-        f"  • Buy patterns: {format_number(data.get('ChartScanAI Buy Patterns'), '.0f')} | Sell patterns: {format_number(data.get('ChartScanAI Sell Patterns'), '.0f')}",
+        f"  • Recommendation: {'🟢 Buy' if data.get('ChartScanAI Recommendation') == 'Buy' else '🔴 Avoid' if data.get('ChartScanAI Recommendation') == 'Avoid' else '🔵 Hold' if data.get('ChartScanAI Recommendation') == 'Hold' else 'N/A'}",
+        f"  • Signal: {data.get('ChartScanAI Signal', 'N/A')}",
+        f"  • Confidence: {data.get('ChartScanAI Confidence', 0):.0%}" if data.get('ChartScanAI Confidence') is not None else "  • Confidence: N/A",
+        f"  • Patterns: {format_number(data.get('ChartScanAI Buy Patterns'), '.0f')} buy / {format_number(data.get('ChartScanAI Sell Patterns'), '.0f')} sell",
         "",
         f"📊 *SUPPORT/RESISTANCE:*",
         f"  • Support: {format_number(data.get('Support'))}",
@@ -813,7 +822,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🎯 *TRADE SETUP:*",
         f"  • Entry: {format_number(data.get('Optimal Entry Price'))}",
         f"  • Stop Loss: {format_number(data.get('Stop Loss'))}",
-        f"  • Stop Basis: {data.get('Stop Loss Basis', 'N/A')}",
+        f"  • Stop Basis: {_escape_md(data.get('Stop Loss Basis', 'N/A'))}",
         "",
         f"🏆 *TAKE PROFIT TARGETS:*",
     ]
@@ -840,7 +849,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         lines.append(f"  • TP3: {format_number(tp3)}  | RR: {format_number(tp3_rr)}x  | +{format_number(tp3_pct)}%")
     
     if tp1 and not pd.isna(tp1):
-        lines.append(f"  📝 TP Basis: {data.get('Take Profit Basis', 'N/A')}")
+        lines.append(f"  📝 TP Basis: {_escape_md(data.get('Take Profit Basis', 'N/A'))}")
     
     # Add market links
     ticker = data.get('Selected Stock', '')
@@ -928,14 +937,12 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 price_str = format_number(price) if price else "N/A"
                 undervalued = "💎" if row.get("Undervalued (Yes/No)") == "Yes" else ""
                 diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
-                # ChartScanAI conflict indicator
-                cs_signal = row.get("ChartScanAI Signal", "")
-                if cs_signal == "Buy" and rec == "Avoid":
-                    cs_mark = " ⚠️🤖"
-                elif cs_signal == "Sell" and rec == "Buy":
-                    cs_mark = " ⚠️🤖"
-                elif cs_signal == "Buy" and rec == "Buy":
+                # ChartScanAI comparison
+                cs_rec = row.get("ChartScanAI Recommendation", "")
+                if cs_rec == rec:
                     cs_mark = " ✅🤖"
+                elif cs_rec and cs_rec != rec and cs_rec in ("Buy", "Avoid"):
+                    cs_mark = " ⚠️🤖"
                 else:
                     cs_mark = ""
                 lines.append(f"  • {ticker} @ {price_str} EGP {undervalued}{diamond}{cs_mark}")
