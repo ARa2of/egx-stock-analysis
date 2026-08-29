@@ -1849,6 +1849,9 @@ def run(input_path: str, output_path: str) -> None:
         p70 = scores.quantile(0.70)
         p45 = scores.quantile(0.45)
 
+        # Add percentile column (0-100 scale)
+        out_df["Score Percentile"] = (scores.rank(pct=True) * 100).round(1)
+
         def _assign_rec(row):
             # Death Cross always Avoid regardless of score
             if row.get("Death Cross (Yes/No)") == "Yes":
