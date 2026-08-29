@@ -1521,6 +1521,7 @@ def build_enhanced_recommendation_and_entry(
 # stays lightweight even after a year+ of daily runs).
 HISTORY_COLUMNS = [
     "Analysis Run Date", "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
+    "Score", "Score %",
     "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
@@ -1843,23 +1844,25 @@ def run(input_path: str, output_path: str) -> None:
     out_df = pd.DataFrame(rows)
 
     # === PERCENTILE-BASED RECOMMENDATION ===
-    # Compute percentiles and assign Buy/Watch/Avoid based on score distribution
-    if "raw_score" in out_df.columns and len(out_df) > 1:
-        scores = out_df["raw_score"]
-        p70 = scores.quantile(0.70)
-        p45 = scores.quantile(0.45)
+    # Compute % of max achievable score and assign Buy/Watch/Avoid
+    if "Score" in out_df.columns and len(out_df) > 1:
+        scores = out_df["Score"]
 
-        # Add percentile column (0-100 scale)
-        out_df["Score Percentile"] = (scores.rank(pct=True) * 100).round(1)
+        # Max achievable score: Golden Cross(1) + Near Support(1.5) + VWMA(0.5) + MACD(0.5)
+        # + Diamond Cross(1) + RSI Oversold(1) + MFI Oversold(1) + Volume Spike(1) + ADL Acc(1) = 8.5
+        MAX_SCORE = 8.5
+
+        # Score as percentage of maximum (0-100%)
+        out_df["Score %"] = ((scores / MAX_SCORE) * 100).round(1)
 
         def _assign_rec(row):
             # Death Cross always Avoid regardless of score
             if row.get("Death Cross (Yes/No)") == "Yes":
                 return "Avoid"
-            s = row["raw_score"]
-            if s >= p70:
+            pct = row["Score %"]
+            if pct >= 70:
                 return "Buy"
-            elif s >= p45:
+            elif pct >= 45:
                 return "Watch"
             else:
                 return "Avoid"
@@ -1869,10 +1872,10 @@ def run(input_path: str, output_path: str) -> None:
         # Update basis to include score info
         for i, row in out_df.iterrows():
             old_basis = row.get("Recommendation Basis", "")
-            score_info = f"score={row['raw_score']:.1f} (p70={p70:.1f}, p45={p45:.1f})"
+            score_info = f"score={row['Score']:.1f}/{MAX_SCORE} ({row['Score %']:.0f}%)"
             out_df.at[i, "Recommendation Basis"] = f"{old_basis}; {score_info}"
 
-        log.info("Percentile recommendations: p70=%.2f, p45=%.2f", p70, p45)
+        log.info("Score-based recommendations: max=%.1f", MAX_SCORE)
         log.info("Recommendations: %s", out_df["Recommendation"].value_counts().to_dict())
 
     log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
