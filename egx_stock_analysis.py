@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 EGX Stock Analysis Tool (Hybrid: TradingView TA + yfinance fallback)
 ====================================================================
@@ -41,6 +41,7 @@ from tradingview_ta import Interval, TradingView
 
 HISTORY_PERIOD = "10y"
 MIN_TRADING_DAYS = 30
+ADL_WINDOW = 20  # trading days (~1 month) used to judge recent accumulation/distribution
 EGX_SUFFIX = ".CA"
 # Split/dividend-adjusted prices from yfinance. Without this, a stock split
 # leaves a phantom "cliff" in the raw price history (e.g. a 2:1 split makes
@@ -58,7 +59,7 @@ STALE_DATA_WARNING_DAYS = 4
 FX_TICKER = "EGP=X"
 EGP_SIMILARITY_BAND = 0.03
 SWING_ORDER = 5
-SR_LOOKBACK_DAYS = 41   # v3 optimized
+SR_LOOKBACK_DAYS = 180
 
 SMA_SHORT_WINDOW = 50
 SMA_LONG_WINDOW = 200
@@ -80,13 +81,11 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 80      # v3 optimized
-RSI_OVERSOLD = 27.65        # v3 optimized
-RSI_HEALTHY_LOW = 50     # v3 optimized
-RSI_HEALTHY_HIGH = 68.22    # v3 optimized
+RSI_OVERBOUGHT = 80.54      # Optimized
+RSI_OVERSOLD = 32.83        # Optimized
 
-VOLUME_SPIKE_MULTIPLIER = 1.95  # v3 optimized
-NEAR_SUPPORT_PCT = 0.0551       # v3 optimized (5.51%)
+VOLUME_SPIKE_MULTIPLIER = 1.96  # Optimized
+NEAR_SUPPORT_PCT = 0.03         # Optimized
 BUY_VOL_AVG_DAYS = 42          # 2-month (trading days) for buy volume average
 
 # --- Optimized indicator thresholds ---
@@ -98,19 +97,20 @@ MFI_OVERSOLD = 20              # MFI < 20 = oversold
 # Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
 # ChartScanAI stays a fully separate, secondary signal (own columns) and never
 # feeds into this score. Weights sum to exactly 100.
-SCORE_WEIGHT_TREND = 17.77     # v3 normalized
-SCORE_WEIGHT_MACD = 14.24      # v3 normalized
-SCORE_WEIGHT_RSI = 19.18       # v3 normalized
-SCORE_WEIGHT_VOLUME = 16.73    # v3 normalized
-SCORE_WEIGHT_ADI = 18.73       # v3 normalized
-SCORE_WEIGHT_SUPPORT = 13.35   # v3 normalized
+SCORE_WEIGHT_TREND = 30.00     # Trend (30%): EMA50/EMA200 alignment is the primary driver
+SCORE_WEIGHT_MACD = 15.00      # Momentum (15%): MACD confirms trend direction and strength
+SCORE_WEIGHT_RSI = 15.00       # Momentum (15%): RSI flags extremes (reduced from 45% to prevent false reversals)
+SCORE_WEIGHT_VOLUME = 15.00    # Volume (15%): Breakouts and moves require volume confirmation
+SCORE_WEIGHT_ADI = 12.5       # Volume flow (12.5%): ADL/MFI tracks institutional accumulation/distribution
+SCORE_WEIGHT_SUPPORT = 12.5   # Support/structure (12.5%): Rewards proximity to safe entry levels
 
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
 # Score thresholds (out of 100) for the base recommendation.
-SCORE_BUY_THRESHOLD = 61    # v3 optimized
-SCORE_WATCH_THRESHOLD = 47.28  # v3 optimized
+# Adjusted to standard quartiles for technical grading.
+SCORE_BUY_THRESHOLD = 60.00
+SCORE_WATCH_THRESHOLD = 50.00
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
@@ -795,12 +795,14 @@ def support_resistance(raw_ticker: str, yf_cache: Dict[str, TickerData]) -> dict
 # Accumulation / Distribution & Money Flow Indicators
 # --------------------------------------------------------------------------
 
-def compute_adl(history: pd.DataFrame) -> Optional[float]:
-    """Compute the Accumulation/Distribution Line.
+def _adl_series(history: pd.DataFrame) -> Optional[np.ndarray]:
+    """Internal helper: full Accumulation/Distribution Line series.
 
     ADL = cumsum(((Close - Low) - (High - Close)) / (High - Low) * Volume)
 
-    Returns the latest ADL value, or None if data is insufficient.
+    Returns the full cumulative array (oldest -> newest), or None if data is
+    insufficient. Shared by compute_adl() and compute_adl_trend() so the line
+    is only computed once.
     """
     if history is None or len(history) < 5:
         return None
@@ -813,10 +815,39 @@ def compute_adl(history: pd.DataFrame) -> Optional[float]:
         # Avoid division by zero
         hl_range[hl_range == 0] = 1e-10
         clv = ((close - low) - (high - close)) / hl_range
-        adl = np.cumsum(clv * vol)
-        return float(adl[-1])
+        return np.cumsum(clv * vol)
     except Exception:
         return None
+
+
+def compute_adl(history: pd.DataFrame) -> Optional[float]:
+    """Latest lifetime-cumulative ADL value (kept for reference/magnitude
+    display only). NOTE: this is a running total since the start of
+    HISTORY_PERIOD, so its sign reflects money flow over the entire history
+    window, not anything recent — do NOT use it to judge current
+    accumulation/distribution. Use compute_adl_trend() for that.
+    """
+    adl = _adl_series(history)
+    if adl is None:
+        return None
+    return float(adl[-1])
+
+
+def compute_adl_trend(history: pd.DataFrame, window: int = ADL_WINDOW) -> Optional[float]:
+    """Change in the ADL line over the last `window` trading days
+    (default ADL_WINDOW = 20, ~1 month).
+
+    This is the actual accumulation/distribution signal: a rising ADL over
+    the recent window means net buying pressure lately (accumulation), a
+    falling ADL means net selling pressure lately (distribution) —
+    regardless of what the lifetime-cumulative level happens to be.
+
+    Returns None if there isn't at least `window` + 1 days of history.
+    """
+    adl = _adl_series(history)
+    if adl is None or len(adl) < window + 1:
+        return None
+    return float(adl[-1] - adl[-1 - window])
 
 
 def compute_mfi(history: pd.DataFrame, period: int = 14) -> Optional[float]:
@@ -1100,9 +1131,9 @@ def get_enhanced_stop_loss(
         stop_price, basis = stop_levels[0]
         return stop_price, f"stop at {basis}"
     
-    # Fallback: ~4.69% below entry (v3 optimized)
-    stop_price = entry_price * (1 - 0.0469)
-    return stop_price, "stop at ~4.69% below entry (default)"
+    # Fallback: 5% below entry
+    stop_price = entry_price * 0.95
+    return stop_price, "stop at 5% below entry (default)"
 
 
 # --------------------------------------------------------------------------
@@ -1401,10 +1432,10 @@ def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[s
     if rsi is None:
         return 0.0, reasons
 
-    if RSI_HEALTHY_LOW <= rsi <= RSI_HEALTHY_HIGH:
+    if 50 <= rsi <= 70:
         score = 1.0
         reasons.append(f"RSI in healthy bullish zone ({rsi:.1f})")
-    elif 40 <= rsi < RSI_HEALTHY_LOW:
+    elif 40 <= rsi < 50:
         score = 0.6
         reasons.append(f"RSI neutral-firm ({rsi:.1f})")
     elif rsi < 40:
@@ -1470,23 +1501,28 @@ def score_volume(vol_multiplier: Optional[float], buy_vol_multiplier: Optional[f
     return min(1.0, max(0.0, score)), reasons
 
 
-def score_adi(adl: Optional[float], mfi: Optional[float]) -> Tuple[float, List[str]]:
+def score_adi(adl_trend: Optional[float], mfi: Optional[float]) -> Tuple[float, List[str]]:
     """Volume flow: Accumulation/Distribution Line, with MFI as supporting
     confirmation - weight = SCORE_WEIGHT_ADI (12.5%).
 
     No neutral baseline — starts at 0 and scales up/down based on actual
     accumulation/distribution signals.
+
+    Uses the ADL_WINDOW-day *change* in ADL (adl_trend), not the raw
+    lifetime-cumulative ADL level — a stock's all-time cumulative ADL can
+    stay positive for years after it starts distributing, so only the
+    recent trend is a meaningful accumulation/distribution signal.
     """
     reasons: List[str] = []
     score = 0.0
 
-    if adl is not None:
-        if adl > 0:
+    if adl_trend is not None:
+        if adl_trend > 0:
             score += 0.5
-            reasons.append("accumulation (ADL positive)")
-        elif adl < 0:
+            reasons.append(f"accumulation (ADL rising over last {ADL_WINDOW}d)")
+        elif adl_trend < 0:
             score -= 0.5
-            reasons.append("distribution (ADL negative)")
+            reasons.append(f"distribution (ADL falling over last {ADL_WINDOW}d)")
 
     if mfi is not None:
         if mfi <= MFI_OVERSOLD:
@@ -1549,6 +1585,7 @@ def build_enhanced_recommendation_and_entry(
     adx_minus: Optional[float] = None,
     mfi: Optional[float] = None,
     adl: Optional[float] = None,
+    adl_trend: Optional[float] = None,
     bb_squeeze: Optional[bool] = None,
     vwma: Optional[float] = None,
     macd_bullish: Optional[str] = None,
@@ -1592,7 +1629,7 @@ def build_enhanced_recommendation_and_entry(
     macd_val, macd_reasons = score_macd(macd, macd_signal)
     rsi_val, rsi_reasons = score_rsi(rsi, adx)
     volume_val, volume_reasons = score_volume(vol_multiplier, buy_multiplier)
-    adi_val, adi_reasons = score_adi(adl, mfi)
+    adi_val, adi_reasons = score_adi(adl_trend, mfi)
     support_val, support_reasons = score_support(is_near_support, is_volume_spike, current_price, support)
 
     # Convert 0.0-1.0 ratios into final weighted score out of 100
@@ -1667,8 +1704,8 @@ def build_enhanced_recommendation_and_entry(
         )
     else:
         if entry_price is not None:
-            stop_loss = entry_price * (1 - 0.0469)
-            stop_loss_basis = "stop at ~4.69% below entry (default)"
+            stop_loss = entry_price * 0.95
+            stop_loss_basis = "stop at 5% below entry (default)"
         else:
             stop_loss = None
             stop_loss_basis = "no stop loss (no entry)"
@@ -1732,7 +1769,7 @@ HISTORY_COLUMNS = [
     "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
-    "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze", "ADL",
+    "ADX", "ADX +DI", "ADX -DI", "MFI", "BB Squeeze", "ADL", "ADL Trend (20d)",
     "ChartScanAI Signal", "ChartScanAI Recommendation", "ChartScanAI Confidence",
     "Volume Multiplier (vs 1Y)", "Buy Volume Multiplier (vs 2-Month)",
     "Support", "Resistance",
@@ -1895,7 +1932,8 @@ def run(input_path: str, output_path: str) -> None:
         sr = support_resistance(raw, yf_cache)
 
         # New indicators: ADL, MFI, BB Squeeze
-        adl = compute_adl(yf_entry.history)
+        adl = compute_adl(yf_entry.history)  # lifetime-cumulative level, display only
+        adl_trend = compute_adl_trend(yf_entry.history)  # ADL_WINDOW-day change, drives scoring/classification
         mfi = compute_mfi(yf_entry.history)
         atr_val = None
         if "High" in yf_entry.history.columns and "Low" in yf_entry.history.columns:
@@ -1973,11 +2011,12 @@ def run(input_path: str, output_path: str) -> None:
             rsi,
             diamond_cross,
             adx, adx_plus, adx_minus,
-            mfi, adl, bb_squeeze,
-            vwma, macd_bullish,
-            ema20, ema50, ema200,
-            vol.get("vol_multiplier"),
-            macd, macd_signal,
+            mfi, adl, bb_squeeze=bb_squeeze,
+            vwma=vwma, macd_bullish=macd_bullish,
+            ema20=ema20, ema50=ema50, ema200=ema200,
+            vol_multiplier=vol.get("vol_multiplier"),
+            macd=macd, macd_signal=macd_signal,
+            adl_trend=adl_trend,
         )
 
         rows.append({
@@ -2023,6 +2062,7 @@ def run(input_path: str, output_path: str) -> None:
             "BB Upper": round(bb_upper, 4) if bb_upper is not None else None,
             "BB Squeeze": "Yes" if bb_squeeze else ("No" if bb_squeeze is not None else None),
             "ADL": round(adl, 0) if adl is not None else None,
+            "ADL Trend (20d)": round(adl_trend, 0) if adl_trend is not None else None,
             "MFI": round(mfi, 2) if mfi is not None else None,
             "TA Data As Of": ta_fetch_time,
             "Optimal Entry Price": rec["optimal_entry_price"],
