@@ -1007,8 +1007,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         entries.sort(key=_sort_key, reverse=True)
 
         emoji, title = section_meta[category]
-        title_suffix = " (Confirmed by one method)" if category == "Buy" else ""
-        lines.append(f"{emoji} *{title}*{title_suffix} ({len(entries)})")
+        lines.append(f"{emoji} *{title}* ({len(entries)})")
         for row, note in entries:
             ticker = row.get("Selected Stock", "?")
             price = row.get("Current EGP Price")
@@ -1019,22 +1018,23 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
             except (ValueError, TypeError):
                 score_str = ""
-            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}")
+            note_str = f" ({note})" if note else ""
+            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
         lines.append("")
 
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
     lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
-    lines.append("🟢 Buy (Confirmed by one method) = only ONE method says Buy")
+    lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
     lines.append("🔴 Avoid = no Buy signal from either method")
 
-    # === ACCUMULATION SECTION: Buy stocks with ADL > 0 (Strong Buy/Buy only) ===
+    # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
     acc_entries = []
-    for cat in ["Strong Buy", "Buy"]:
+    for cat in ["Strong Buy", "Buy", "Watch"]:
         for row, note in buckets.get(cat, []):
-            adl_trend = row.get("ADL Trend (20d)")
+            adl = row.get("ADL")
             try:
-                if adl_trend is not None and float(adl_trend) > 0:
+                if adl is not None and float(adl) > 0:
                     acc_entries.append((row, note, cat))
             except (ValueError, TypeError):
                 pass
