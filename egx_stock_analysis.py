@@ -81,12 +81,12 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 80.54      # Optimized
-RSI_OVERSOLD = 32.83        # Optimized
+RSI_OVERBOUGHT = 88.04446526467831       # Optimized[cite: 3]
+RSI_OVERSOLD = 27.647146501645125        # Optimized[cite: 3]
 
-VOLUME_SPIKE_MULTIPLIER = 1.96  # Optimized
-NEAR_SUPPORT_PCT = 0.03         # Optimized
-BUY_VOL_AVG_DAYS = 42          # 2-month (trading days) for buy volume average
+VOLUME_SPIKE_MULTIPLIER = 1.9538223538123156  # Optimized[cite: 3]
+NEAR_SUPPORT_PCT = 0.05506615218534689          # Optimized[cite: 3]
+BUY_VOL_AVG_DAYS = 42                         # 2-month (trading days) for buy volume average
 
 # --- Optimized indicator thresholds ---
 ADX_TREND_THRESHOLD = 25       # ADX > 25 = strong trend
@@ -96,21 +96,21 @@ MFI_OVERSOLD = 20              # MFI < 20 = oversold
 # --- Base recommendation scoring weights (0-100 scale) ---
 # Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
 # ChartScanAI stays a fully separate, secondary signal (own columns) and never
-# feeds into this score. Weights sum to exactly 100.
-SCORE_WEIGHT_TREND = 30.00     # Trend (30%): EMA50/EMA200 alignment is the primary driver
-SCORE_WEIGHT_MACD = 15.00      # Momentum (15%): MACD confirms trend direction and strength
-SCORE_WEIGHT_RSI = 15.00       # Momentum (15%): RSI flags extremes (reduced from 45% to prevent false reversals)
-SCORE_WEIGHT_VOLUME = 15.00    # Volume (15%): Breakouts and moves require volume confirmation
-SCORE_WEIGHT_ADI = 12.5       # Volume flow (12.5%): ADL/MFI tracks institutional accumulation/distribution
-SCORE_WEIGHT_SUPPORT = 12.5   # Support/structure (12.5%): Rewards proximity to safe entry levels
+# feeds into this score. Weights sum to exactly 100 based on normalized weights.
+SCORE_WEIGHT_TREND = 17.768704016021527     # Trend (17.77%): EMA50/EMA200 alignment[cite: 3]
+SCORE_WEIGHT_MACD = 14.238912102139023      # Momentum (14.24%): MACD confirms direction[cite: 3]
+SCORE_WEIGHT_RSI = 19.177576820499485       # Momentum (19.18%): RSI flags extremes[cite: 3]
+SCORE_WEIGHT_VOLUME = 16.73304900441024     # Volume (16.73%): Breakout confirmation[cite: 3]
+SCORE_WEIGHT_ADI = 18.731629810886304       # Volume flow (18.73%): ADL/MFI tracks flow[cite: 3]
+SCORE_WEIGHT_SUPPORT = 13.35012824604343    # Support/structure (13.35%): Safe entry levels[cite: 3]
 
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
 # Score thresholds (out of 100) for the base recommendation.
-# Adjusted to standard quartiles for technical grading.
-SCORE_BUY_THRESHOLD = 60.00
-SCORE_WATCH_THRESHOLD = 50.00
+# Adjusted using the optimized diagnostic values.
+SCORE_BUY_THRESHOLD = 61
+SCORE_WATCH_THRESHOLD = 47.28348345360217
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
