@@ -109,7 +109,7 @@ assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
 # Score thresholds (out of 100) for the base recommendation.
-SCORE_BUY_THRESHOLD = 72.28    # v3 optimized
+SCORE_BUY_THRESHOLD = 61    # v3 optimized
 SCORE_WATCH_THRESHOLD = 47.28  # v3 optimized
 
 # Enhanced entry configuration
