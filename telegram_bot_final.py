@@ -1018,6 +1018,34 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
     lines.append("🟡/🔴 Watch/Avoid = base score, no Buy signal from either method")
 
+    # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
+    acc_entries = []
+    for cat in ["Strong Buy", "Buy", "Watch"]:
+        for row, note in buckets.get(cat, []):
+            adl = row.get("ADL")
+            if adl is not None and not pd.isna(adl) and adl > 0:
+                acc_entries.append((row, note, cat))
+
+    if acc_entries:
+        def _acc_sort(item):
+            row, _, _ = item
+            score = row.get("Score") if has_score else None
+            return score if score is not None and not pd.isna(score) else -1
+
+        acc_entries.sort(key=_acc_sort, reverse=True)
+        lines.append("")
+        lines.append(f"📈 *IN ACCUMULATION* ({len(acc_entries)})")
+        for row, note, orig_cat in acc_entries:
+            ticker = row.get("Selected Stock", "?")
+            price = row.get("Current EGP Price")
+            price_str = format_number(price) if price else "N/A"
+            score = row.get("Score") if has_score else None
+            score_str = f" | Score: {score:.0f}/100" if score is not None and not pd.isna(score) else ""
+            adl_val = row.get("ADL")
+            adl_str = f" | ADL: {format_number(adl_val, 0)}" if adl_val is not None and not pd.isna(adl_val) else ""
+            lines.append(f"  • {ticker} @ {price_str} EGP{score_str}{adl_str}")
+        lines.append("")
+
     # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()
     keyboard = []
