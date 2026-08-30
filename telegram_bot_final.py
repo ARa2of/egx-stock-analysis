@@ -561,13 +561,14 @@ def _escape_md(text: str) -> str:
 
 def format_number(val, decimals=2):
     """Format a number for display."""
-    if val is None or pd.isna(val):
+    if val is None:
         return "N/A"
     try:
-        if isinstance(val, (int, float)):
-            return f"{float(val):,.{decimals}f}"
-        return str(val)
-    except:
+        fval = float(val)
+        if pd.isna(fval):
+            return "N/A"
+        return f"{fval:,.{decimals}f}"
+    except (ValueError, TypeError):
         return str(val)
 
 # --------------------------------------------------------------------------
@@ -982,7 +983,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Avoid": ("🔴", "AVOID"),
     }
 
-    for category in ["Strong Buy", "Buy", "Watch", "Avoid"]:
+    for category in ["Strong Buy", "Buy", "Avoid"]:
         entries = buckets.get(category, [])
         if not entries:
             continue
@@ -1013,7 +1014,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             price_str = format_number(price) if price else "N/A"
             diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
             score = row.get("Score") if has_score else None
-            score_str = f" | Score: {score:.0f}/100" if score is not None and not pd.isna(score) else ""
+            try:
+                score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
+            except (ValueError, TypeError):
+                score_str = ""
             note_str = f" ({note})" if note else ""
             lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
         lines.append("")
@@ -1022,7 +1026,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines.append("")
     lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
     lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
-    lines.append("🟡/🔴 Watch/Avoid = base score, no Buy signal from either method")
+    lines.append("🔴 Avoid = no Buy signal from either method")
 
     # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
     acc_entries = []
@@ -1052,7 +1056,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             price = row.get("Current EGP Price")
             price_str = format_number(price) if price else "N/A"
             score = row.get("Score") if has_score else None
-            score_str = f" | Score: {score:.0f}/100" if score is not None else ""
+            try:
+                score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
+            except (ValueError, TypeError):
+                score_str = ""
             lines.append(f"  • {ticker} @ {price_str} EGP{score_str}")
         lines.append("")
 
