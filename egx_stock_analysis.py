@@ -92,22 +92,24 @@ ADX_TREND_THRESHOLD = 25       # ADX > 25 = strong trend
 MFI_OVERBOUGHT = 80            # MFI > 80 = overbought
 MFI_OVERSOLD = 20              # MFI < 20 = oversold
 
-# --- Base recommendation scoring weights (0-100 scale, optimized) ---
+# --- Base recommendation scoring weights (0-100 scale) ---
 # Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
 # ChartScanAI stays a fully separate, secondary signal (own columns) and never
 # feeds into this score. Weights sum to exactly 100.
-SCORE_WEIGHT_TREND = 20.29     # Trend: EMA50/EMA200 alignment + cross
-SCORE_WEIGHT_MACD = 1.76       # Momentum: MACD bullish signal
-SCORE_WEIGHT_RSI = 44.79       # Momentum/overbought-oversold: RSI(14)
-SCORE_WEIGHT_VOLUME = 1.58     # Volume confirmation: relative volume + surge
-SCORE_WEIGHT_ADI = 28.28       # Volume flow: Accumulation/Distribution Line
-SCORE_WEIGHT_SUPPORT = 3.30    # Support/structure
+SCORE_WEIGHT_TREND = 30.00     # Trend (30%): EMA50/EMA200 alignment is the primary driver
+SCORE_WEIGHT_MACD = 15.00      # Momentum (15%): MACD confirms trend direction and strength
+SCORE_WEIGHT_RSI = 15.00       # Momentum (15%): RSI flags extremes (reduced from 45% to prevent false reversals)
+SCORE_WEIGHT_VOLUME = 15.00    # Volume (15%): Breakouts and moves require volume confirmation
+SCORE_WEIGHT_ADI = 12.5       # Volume flow (12.5%): ADL/MFI tracks institutional accumulation/distribution
+SCORE_WEIGHT_SUPPORT = 12.5   # Support/structure (12.5%): Rewards proximity to safe entry levels
+
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
-# Score thresholds (out of 100) for the base recommendation (optimized).
-SCORE_BUY_THRESHOLD = 79.88
-SCORE_WATCH_THRESHOLD = 54.88
+# Score thresholds (out of 100) for the base recommendation.
+# Adjusted to standard quartiles for technical grading.
+SCORE_BUY_THRESHOLD = 75.00
+SCORE_WATCH_THRESHOLD = 50.00
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
@@ -775,11 +777,13 @@ def support_resistance(raw_ticker: str, yf_cache: Dict[str, TickerData]) -> dict
 
     current_price = float(hist["Close"].iloc[-1])
 
-    above = [v for _, v in swing_highs if v >= current_price]
-    resistance = min(above) if above else (swing_highs[-1][1] if swing_highs else None)
+    above = [v for _, v in swing_highs if v > current_price]
+    # Do not fallback to lower highs if 'above' is empty
+    resistance = min(above) if above else None
 
-    below = [v for _, v in swing_lows if v <= current_price]
-    support = max(below) if below else (swing_lows[-1][1] if swing_lows else None)
+    below = [v for _, v in swing_lows if v < current_price]
+    # Do not fallback to higher lows if 'below' is empty
+    support = max(below) if below else None
 
     result["support"] = float(support) if support is not None else None
     result["resistance"] = float(resistance) if resistance is not None else None
@@ -1178,14 +1182,20 @@ def calculate_take_profit_levels(
                 target_move = result["take_profit_1"] - entry_price
                 result["take_profit_2"] = round(result["take_profit_1"] + target_move * 0.5, 4)
         
-        # TP3: Third resistance level or highest available (most aggressive)
+# TP3: Third resistance level or highest available (most aggressive)
         if len(unique_levels) >= 3:
             result["take_profit_3"] = round(unique_levels[2][0], 4)
         elif len(unique_levels) == 2:
             # Use a Fibonacci extension from R2
             if result["take_profit_2"] and entry_price:
                 target_move = result["take_profit_2"] - entry_price
-                result["take_profit_3"] = round(result["take_profit_2"] + target_move * 0.382, 4)
+                result["take_profit_3"] = round(result["take_profit_2"] + target_move * 0.618, 4)
+        else:
+            # Use the highest available with a multiplier
+            if unique_levels and entry_price and result["take_profit_2"]:
+                target_move = unique_levels[-1][0] - entry_price
+                # Extend 100% of the initial move from TP1 to create TP3
+                result["take_profit_3"] = round(unique_levels[-1][0] + target_move * 1.0, 4)
         else:
             # Use the highest available with a multiplier
             if unique_levels and entry_price:
