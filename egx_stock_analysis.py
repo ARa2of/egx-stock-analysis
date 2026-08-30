@@ -80,9 +80,9 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 88.04      # v3 optimized
+RSI_OVERBOUGHT = 80      # v3 optimized
 RSI_OVERSOLD = 27.65        # v3 optimized
-RSI_HEALTHY_LOW = 54.58     # v3 optimized
+RSI_HEALTHY_LOW = 50     # v3 optimized
 RSI_HEALTHY_HIGH = 68.22    # v3 optimized
 
 VOLUME_SPIKE_MULTIPLIER = 1.95  # v3 optimized
