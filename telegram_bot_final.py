@@ -992,9 +992,15 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         def _sort_key(item):
             row, _ = item
             score = row.get("Score") if has_score else None
-            score = score if score is not None and not pd.isna(score) else -1
+            try:
+                score = float(score) if score is not None else -1
+            except (ValueError, TypeError):
+                score = -1
             conf = row.get("ChartScanAI Confidence") if has_chartscan else None
-            conf = conf if conf is not None and not pd.isna(conf) else -1
+            try:
+                conf = float(conf) if conf is not None else -1
+            except (ValueError, TypeError):
+                conf = -1
             return (score, conf)
 
         entries.sort(key=_sort_key, reverse=True)
@@ -1023,14 +1029,20 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for cat in ["Strong Buy", "Buy", "Watch"]:
         for row, note in buckets.get(cat, []):
             adl = row.get("ADL")
-            if adl is not None and not pd.isna(adl) and adl > 0:
-                acc_entries.append((row, note, cat))
+            try:
+                if adl is not None and float(adl) > 0:
+                    acc_entries.append((row, note, cat))
+            except (ValueError, TypeError):
+                pass
 
     if acc_entries:
         def _acc_sort(item):
             row, _, _ = item
             score = row.get("Score") if has_score else None
-            return score if score is not None and not pd.isna(score) else -1
+            try:
+                return float(score) if score is not None else -1
+            except (ValueError, TypeError):
+                return -1
 
         acc_entries.sort(key=_acc_sort, reverse=True)
         lines.append("")
@@ -1040,10 +1052,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             price = row.get("Current EGP Price")
             price_str = format_number(price) if price else "N/A"
             score = row.get("Score") if has_score else None
-            score_str = f" | Score: {score:.0f}/100" if score is not None and not pd.isna(score) else ""
-            adl_val = row.get("ADL")
-            adl_str = f" | ADL: {format_number(adl_val, 0)}" if adl_val is not None and not pd.isna(adl_val) else ""
-            lines.append(f"  • {ticker} @ {price_str} EGP{score_str}{adl_str}")
+            score_str = f" | Score: {score:.0f}/100" if score is not None else ""
+            lines.append(f"  • {ticker} @ {price_str} EGP{score_str}")
         lines.append("")
 
     # Create buttons (limit to 30 tickers)
