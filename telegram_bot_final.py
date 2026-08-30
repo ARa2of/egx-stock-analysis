@@ -941,14 +941,14 @@ def classify_display_recommendation(base_rec: Optional[str], cs_rec: Optional[st
 
     if base_buy and not cs_buy:
         if cs_rec == "Avoid":
-            return "Buy", "⚠️ ChartScanAI says Avoid"
+            return "Buy", "ChartScanAI: Avoid"
         elif cs_rec == "Hold":
-            return "Buy", "ChartScanAI neutral"
+            return "Buy", "ChartScanAI: Hold"
         else:
             return "Buy", "ChartScanAI: no signal"
 
     if cs_buy and not base_buy:
-        return "Buy", f"⚠️ base indicators say {base_rec}"
+        return "Buy", f"base: {base_rec}"
 
     # Neither method says Buy - use the base recommendation as-is.
     return base_rec, None
@@ -1012,56 +1012,20 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             ticker = row.get("Selected Stock", "?")
             price = row.get("Current EGP Price")
             price_str = format_number(price) if price else "N/A"
-            diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
             score = row.get("Score") if has_score else None
             try:
                 score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
             except (ValueError, TypeError):
                 score_str = ""
             note_str = f" ({note})" if note else ""
-            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
+            lines.append(f"  • {ticker} @ {price_str} EGP{score_str}{note_str}")
         lines.append("")
 
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
-    lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
-    lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
-    lines.append("🔴 Avoid = no Buy signal from either method")
-
-    # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
-    acc_entries = []
-    for cat in ["Strong Buy", "Buy", "Watch"]:
-        for row, note in buckets.get(cat, []):
-            adl = row.get("ADL")
-            try:
-                if adl is not None and float(adl) > 0:
-                    acc_entries.append((row, note, cat))
-            except (ValueError, TypeError):
-                pass
-
-    if acc_entries:
-        def _acc_sort(item):
-            row, _, _ = item
-            score = row.get("Score") if has_score else None
-            try:
-                return float(score) if score is not None else -1
-            except (ValueError, TypeError):
-                return -1
-
-        acc_entries.sort(key=_acc_sort, reverse=True)
-        lines.append("")
-        lines.append(f"📈 *IN ACCUMULATION* ({len(acc_entries)})")
-        for row, note, orig_cat in acc_entries:
-            ticker = row.get("Selected Stock", "?")
-            price = row.get("Current EGP Price")
-            price_str = format_number(price) if price else "N/A"
-            score = row.get("Score") if has_score else None
-            try:
-                score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
-            except (ValueError, TypeError):
-                score_str = ""
-            lines.append(f"  • {ticker} @ {price_str} EGP{score_str}")
-        lines.append("")
+    lines.append("🔥 Strong Buy = base + ChartScanAI both say Buy")
+    lines.append("🟢 Buy = only ONE says Buy")
+    lines.append("🔴 Avoid = no Buy signal")
 
     # Create buttons (limit to 30 tickers)
     tickers = df["Selected Stock"].tolist()
