@@ -1196,12 +1196,6 @@ def calculate_take_profit_levels(
                 target_move = unique_levels[-1][0] - entry_price
                 # Extend 100% of the initial move from TP1 to create TP3
                 result["take_profit_3"] = round(unique_levels[-1][0] + target_move * 1.0, 4)
-        else:
-            # Use the highest available with a multiplier
-            if unique_levels and entry_price:
-                highest = unique_levels[-1][0]
-                target_move = highest - entry_price
-                result["take_profit_3"] = round(highest + target_move * 0.236, 4)
         
         # Build basis explanation with labels
         basis_parts = []
