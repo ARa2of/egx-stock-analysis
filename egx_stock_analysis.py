@@ -108,7 +108,7 @@ assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
 
 # Score thresholds (out of 100) for the base recommendation.
 # Adjusted to standard quartiles for technical grading.
-SCORE_BUY_THRESHOLD = 75.00
+SCORE_BUY_THRESHOLD = 60.00
 SCORE_WATCH_THRESHOLD = 50.00
 
 # Enhanced entry configuration
