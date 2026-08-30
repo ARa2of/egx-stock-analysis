@@ -765,7 +765,7 @@ def format_stock_response(data: Dict[str, Any]) -> str:
         f"🕐 *TA Data:* {data.get('TA Data As Of', 'N/A')}",  # New line for TA timestamp
         "",
         f"{emoji} *RECOMMENDATION:* {rec}",
-        f"🎯 *Score:* {format_number(data.get('Score %'), 0)}%"
+        f"🎯 *Score:* {format_number(data.get('Score'), 0)}/100"
         + (
             f"  (Trend {format_number(data.get('Score - Trend'), 0)} · "
             f"MACD {format_number(data.get('Score - MACD'), 0)} · "
@@ -1007,13 +1007,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             price_str = format_number(price) if price else "N/A"
             diamond = "💠" if row.get("Diamond Cross (20>50) (Yes/No)") == "Yes" else ""
             score = row.get("Score") if has_score else None
-            score_pct = row.get("Score %") if "Score %" in row.index else None
-            if score_pct is not None and not pd.isna(score_pct):
-                score_str = f" | Score: {score_pct:.0f}%"
-            elif score is not None and not pd.isna(score):
-                score_str = f" | Score: {score:.0f}"
-            else:
-                score_str = ""
+            score_str = f" | Score: {score:.0f}/100" if score is not None and not pd.isna(score) else ""
             note_str = f" ({note})" if note else ""
             lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
         lines.append("")

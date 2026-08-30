@@ -80,11 +80,11 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 76.7      # Optimized
-RSI_OVERSOLD = 26.5        # Optimized
+RSI_OVERBOUGHT = 80.54      # Optimized
+RSI_OVERSOLD = 32.83        # Optimized
 
-VOLUME_SPIKE_MULTIPLIER = 1.46  # Optimized
-NEAR_SUPPORT_PCT = 0.0425       # Optimized (4.25%)
+VOLUME_SPIKE_MULTIPLIER = 1.96  # Optimized
+NEAR_SUPPORT_PCT = 0.03         # Optimized
 BUY_VOL_AVG_DAYS = 42          # 2-month (trading days) for buy volume average
 
 # --- Optimized indicator thresholds ---
@@ -92,20 +92,22 @@ ADX_TREND_THRESHOLD = 25       # ADX > 25 = strong trend
 MFI_OVERBOUGHT = 80            # MFI > 80 = overbought
 MFI_OVERSOLD = 20              # MFI < 20 = oversold
 
-# --- Optimized scoring weights (from backtest optimization) ---
-W_TREND = 5.0          # Golden/Death Cross
-W_MACD = 11.7          # MACD Bullish
-W_RSI = 39.7           # RSI signals (dominant)
-W_VOLUME = 18.6        # Volume spike
-W_ADI = 16.7           # ADL accumulation/distribution
-W_SUPPORT = 8.3        # Near support
-W_DIAMOND = 5.0        # Diamond Cross (trend-adjacent)
-W_VWMA = 0.5           # Price vs VWMA (not optimized, kept small)
-W_MFI = 10.0           # MFI (not in optimization, moderate)
+# --- Base recommendation scoring weights (0-100 scale, optimized) ---
+# Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
+# ChartScanAI stays a fully separate, secondary signal (own columns) and never
+# feeds into this score. Weights sum to exactly 100.
+SCORE_WEIGHT_TREND = 20.29     # Trend: EMA50/EMA200 alignment + cross
+SCORE_WEIGHT_MACD = 1.76       # Momentum: MACD bullish signal
+SCORE_WEIGHT_RSI = 44.79       # Momentum/overbought-oversold: RSI(14)
+SCORE_WEIGHT_VOLUME = 1.58     # Volume confirmation: relative volume + surge
+SCORE_WEIGHT_ADI = 28.28       # Volume flow: Accumulation/Distribution Line
+SCORE_WEIGHT_SUPPORT = 3.30    # Support/structure
+assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
+           SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
-# Optimized thresholds (percentage of max score)
-BUY_THRESHOLD_PCT = 66.0
-WATCH_THRESHOLD_PCT = 41.0
+# Score thresholds (out of 100) for the base recommendation (optimized).
+SCORE_BUY_THRESHOLD = 79.88
+SCORE_WATCH_THRESHOLD = 54.88
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
@@ -1307,6 +1309,188 @@ def compute_sma_ema_rsi_from_yf(history: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Base Recommendation Scoring (0-100 rubric)
+# --------------------------------------------------------------------------
+# Six weighted categories, each scored independently and summed to a single
+# 0-100 score that drives the base Buy/Watch/Avoid recommendation (see
+# build_enhanced_recommendation_and_entry() below). ChartScanAI (YOLOv8
+# chart-pattern detection) remains a fully separate, secondary signal with
+# its own columns - it is never an input to this score.
+
+def score_trend(
+    current_price: Optional[float],
+    ema20: Optional[float],
+    ema50: Optional[float],
+    ema200: Optional[float],
+) -> Tuple[float, List[str]]:
+    """Trend: EMA50/EMA200 alignment + cross - weight = SCORE_WEIGHT_TREND (20.29).
+
+    Full marks need price > EMA50 > EMA200 (strong alignment). Partial
+    credit for a bullish EMA50>EMA200 cross alone. Bonus for a steep
+    EMA20>EMA50 (Diamond Cross) and for price trading well above EMA200
+    (a simple slope/distance proxy).
+    """
+    reasons: List[str] = []
+    if current_price is None or ema50 is None or ema200 is None:
+        return 0.0, reasons
+
+    # Scale factor: original max internal=35, new weight=20.29
+    S = SCORE_WEIGHT_TREND / 35.0
+    pts = 0.0
+    ema_bullish = ema50 > ema200
+    price_above_50 = current_price > ema50
+    price_above_200 = current_price > ema200
+
+    if price_above_50 and ema_bullish:
+        pts += 20.0 * S
+        reasons.append("price > EMA50 > EMA200 (strong bullish alignment)")
+    elif price_above_200 and ema_bullish:
+        pts += 12.0 * S
+        reasons.append("EMA50 > EMA200, price above EMA200")
+    elif ema_bullish:
+        pts += 6.0 * S
+        reasons.append("EMA50 > EMA200 but price below EMA50")
+    else:
+        reasons.append("EMA50 <= EMA200 (bearish structure)")
+
+    if ema20 is not None and ema20 > ema50:
+        pts += 7.0 * S
+        reasons.append("Diamond Cross (EMA20>EMA50)")
+
+    if price_above_200:
+        distance_pct = (current_price - ema200) / ema200
+        slope_bonus = min(8.0 * S, max(0.0, distance_pct * 40.0 * S))
+        if slope_bonus > 0:
+            pts += slope_bonus
+            reasons.append(f"price {distance_pct * 100:.1f}% above EMA200")
+
+    return min(pts, SCORE_WEIGHT_TREND), reasons
+
+
+def score_macd(macd: Optional[float], macd_signal: Optional[float]) -> Tuple[float, List[str]]:
+    """Momentum: MACD bullish signal - weight = SCORE_WEIGHT_MACD (1.76).
+
+    Credit for MACD line above its signal line, with a bonus if MACD is
+    also above zero (confirms the bullish momentum, not just a crossover).
+    """
+    reasons: List[str] = []
+    if macd is None or macd_signal is None:
+        return 0.0, reasons
+
+    S = SCORE_WEIGHT_MACD / 15.0
+    pts = 0.0
+    if macd > macd_signal:
+        pts += 8.0 * S
+        reasons.append("MACD line above signal (bullish)")
+        if macd > 0:
+            pts += 7.0 * S
+            reasons.append("MACD above zero (confirmed momentum)")
+    else:
+        reasons.append("MACD below signal (bearish)")
+
+    return min(pts, SCORE_WEIGHT_MACD), reasons
+
+
+def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[str]]:
+    """Momentum/overbought-oversold: RSI(14) - weight = SCORE_WEIGHT_RSI (44.79).
+
+    Full marks for a healthy bullish 50-70 zone. Partial credit for oversold
+    (<40, potential reversal). Overbought (>70) is penalized, with the
+    penalty reduced when ADX shows a strong trend already underway.
+    """
+    reasons: List[str] = []
+    if rsi is None:
+        return 0.0, reasons
+
+    S = SCORE_WEIGHT_RSI / 15.0
+    if 50 <= rsi <= 70:
+        pts = 15.0 * S
+        reasons.append(f"RSI in healthy bullish zone ({rsi:.1f})")
+    elif 40 <= rsi < 50:
+        pts = 8.0 * S
+        reasons.append(f"RSI neutral-firm ({rsi:.1f})")
+    elif rsi < 40:
+        pts = (10.0 if rsi <= RSI_OVERSOLD else 6.0) * S
+        reasons.append(f"RSI oversold, potential reversal ({rsi:.1f})")
+    elif rsi <= 80:
+        strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
+        pts = (5.0 if strong_trend else -5.0) * S
+        note = " (strong trend, penalty reduced)" if strong_trend else ""
+        reasons.append(f"RSI overbought ({rsi:.1f}){note}")
+    else:
+        pts = -10.0 * S
+        reasons.append(f"RSI extremely overbought ({rsi:.1f})")
+
+    return pts, reasons
+
+
+def score_volume(vol_multiplier: Optional[float], buy_vol_multiplier: Optional[float]) -> Tuple[float, List[str]]:
+    """Volume confirmation: relative volume + buy-volume multiplier/surge -
+    weight = SCORE_WEIGHT_VOLUME (1.58).
+    """
+    reasons: List[str] = []
+    S = SCORE_WEIGHT_VOLUME / 20.0
+    pts = 0.0
+
+    if vol_multiplier is not None:
+        if vol_multiplier >= 2.0:
+            pts += 12.0 * S
+            reasons.append(f"volume surge ({vol_multiplier:.2f}x average)")
+        elif vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
+            pts += 8.0 * S
+            reasons.append(f"above-average volume ({vol_multiplier:.2f}x)")
+        elif vol_multiplier >= 1.0:
+            pts += 3.0 * S
+
+    if buy_vol_multiplier is not None:
+        if buy_vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
+            pts += 8.0 * S
+            reasons.append(f"buy-volume spike ({buy_vol_multiplier:.2f}x 2-month avg)")
+        elif buy_vol_multiplier >= 1.0:
+            pts += 3.0 * S
+
+    return min(pts, SCORE_WEIGHT_VOLUME), reasons
+
+
+def score_adi(adl: Optional[float], mfi: Optional[float]) -> Tuple[float, List[str]]:
+    """Volume flow: Accumulation/Distribution Line, with MFI as supporting
+    confirmation - weight = SCORE_WEIGHT_ADI (28.28).
+    """
+    reasons: List[str] = []
+    S = SCORE_WEIGHT_ADI / 10.0
+    pts = 0.0
+
+    if adl is not None:
+        if adl > 0:
+            pts += 8.0 * S
+            reasons.append("accumulation (ADL positive)")
+        elif adl < 0:
+            pts -= 5.0 * S
+            reasons.append("distribution (ADL negative)")
+
+    if mfi is not None:
+        if mfi <= MFI_OVERSOLD:
+            pts += 2.0 * S
+            reasons.append(f"MFI oversold ({mfi:.1f})")
+        elif mfi >= MFI_OVERBOUGHT:
+            pts -= 2.0 * S
+            reasons.append(f"MFI overbought ({mfi:.1f})")
+
+    return pts, reasons
+
+
+def score_support(is_near_support: bool, volume_confirmed: bool) -> Tuple[float, List[str]]:
+    """Support/structure: price near/bouncing off a clear support level, with
+    volume confirmation - weight = SCORE_WEIGHT_SUPPORT (3.30).
+    """
+    if not is_near_support:
+        return 0.0, []
+    if volume_confirmed:
+        return SCORE_WEIGHT_SUPPORT, ["support bounce confirmed by volume"]
+    return SCORE_WEIGHT_SUPPORT * 0.6, ["price near support"]
+
+
+# --------------------------------------------------------------------------
 # Enhanced Recommendation & Entry (with original logic as fallback)
 # --------------------------------------------------------------------------
 
@@ -1330,44 +1514,34 @@ def build_enhanced_recommendation_and_entry(
     bb_squeeze: Optional[bool] = None,
     vwma: Optional[float] = None,
     macd_bullish: Optional[str] = None,
+    ema20: Optional[float] = None,
+    ema50: Optional[float] = None,
+    ema200: Optional[float] = None,
+    vol_multiplier: Optional[float] = None,
+    macd: Optional[float] = None,
+    macd_signal: Optional[float] = None,
 ) -> dict:
     """
-    Enhanced recommendation with better entry price using TradingView indicators.
-    Falls back to original logic if USE_ENHANCED_ENTRY is False or if TA data is missing.
+    Base recommendation is driven by the 0-100 weighted scoring rubric
+    (score_trend/score_macd/score_rsi/score_volume/score_adi/score_support
+    above). ChartScanAI stays entirely separate as a secondary signal (its own
+    Signal/Recommendation/Confidence columns) - it is not an input here.
+    Entry/stop-loss/take-profit logic (enhanced TradingView-indicator based,
+    with the original SMA/support fallback) is unchanged.
     """
     reasons = []
 
-    # === CORE SIGNALS ===
+    # === SUPPORT CHECK (also feeds entry-price logic below) ===
     buy_multiplier = mf.get("buy_vol_multiplier")
     is_volume_spike = buy_multiplier is not None and buy_multiplier >= VOLUME_SPIKE_MULTIPLIER
-    if is_volume_spike:
-        reasons.append("buy-volume spike")
 
     support = sr.get("support")
     is_near_support = False
     if current_price is not None and support is not None and support > 0:
         distance_pct = (current_price - support) / support
         is_near_support = 0 <= distance_pct <= NEAR_SUPPORT_PCT
-    if is_near_support:
-        reasons.append("near support")
 
-    # === INDICATOR SIGNALS ===
-    has_strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
-    adx_bullish_dir = adx_plus is not None and adx_minus is not None and adx_plus > adx_minus
-    adx_bearish_dir = adx_plus is not None and adx_minus is not None and adx_minus > adx_plus
-    is_mfi_overbought = mfi is not None and mfi >= MFI_OVERBOUGHT
-    is_mfi_oversold = mfi is not None and mfi <= MFI_OVERSOLD
-    is_accumulating = adl is not None and adl > 0
-    is_distributing = adl is not None and adl < 0
-    has_diamond = diamond_cross == "Yes"
-    overbought = rsi is not None and rsi >= RSI_OVERBOUGHT
-    oversold = rsi is not None and rsi <= RSI_OVERSOLD
-
-    # VWMA and MACD Bullish signals
-    price_above_vwma = current_price is not None and vwma is not None and current_price >= vwma
-    is_macd_bullish = macd_bullish == "Yes"
-
-    # === TREND REGIME (only Golden/Death Cross) ===
+    # === TREND REGIME ===
     if golden_cross == "Yes":
         regime = "bullish"
     elif death_cross == "Yes":
@@ -1375,87 +1549,46 @@ def build_enhanced_recommendation_and_entry(
     else:
         regime = "unknown"
 
-    # === WEIGHTED SCORING (optimized weights) ===
-    score = 0.0
-    sub_trend = 0.0
-    sub_macd = 0.0
-    sub_rsi = 0.0
-    sub_volume = 0.0
-    sub_adi = 0.0
-    sub_support = 0.0
+    # === WEIGHTED SCORING (0-100) ===
+    trend_pts, trend_reasons = score_trend(current_price, ema20, ema50, ema200)
+    macd_pts, macd_reasons = score_macd(macd, macd_signal)
+    rsi_pts, rsi_reasons = score_rsi(rsi, adx)
+    volume_pts, volume_reasons = score_volume(vol_multiplier, buy_multiplier)
+    adi_pts, adi_reasons = score_adi(adl, mfi)
+    support_pts, support_reasons = score_support(is_near_support, is_volume_spike)
 
-    # --- Trend (Golden/Death Cross) ---
-    if regime == "bullish":
-        score += W_TREND
-        sub_trend = W_TREND
-        reasons.append("Golden Cross confirmed")
-    elif regime == "bearish":
-        score -= W_TREND * 2  # Death Cross penalized 2x
-        sub_trend = -W_TREND * 2
-        reasons.append("Death Cross (confirmed downtrend)")
+    raw_score = trend_pts + macd_pts + rsi_pts + volume_pts + adi_pts + support_pts
+    raw_score = max(0.0, min(100.0, raw_score))
 
-    # --- Price vs Support ---
-    if is_near_support:
-        score += W_SUPPORT
-        sub_support = W_SUPPORT
-        reasons.append("near support")
+    reasons.extend(trend_reasons)
+    reasons.extend(macd_reasons)
+    reasons.extend(rsi_reasons)
+    reasons.extend(volume_reasons)
+    reasons.extend(adi_reasons)
+    reasons.extend(support_reasons)
 
-    # --- Price vs VWMA ---
-    if price_above_vwma:
-        score += W_VWMA
-        reasons.append("price >= VWMA")
+    score_breakdown = {
+        "trend": round(trend_pts, 2),
+        "macd": round(macd_pts, 2),
+        "rsi": round(rsi_pts, 2),
+        "volume": round(volume_pts, 2),
+        "adi": round(adi_pts, 2),
+        "support": round(support_pts, 2),
+    }
 
-    # --- MACD ---
-    if is_macd_bullish:
-        score += W_MACD
-        sub_macd = W_MACD
-        reasons.append("MACD bullish")
+    # === RECOMMENDATION ===
+    if death_cross == "Yes":
+        recommendation = "Avoid"
+        reasons.append("Death Cross (SMA50<SMA200) overrides score to Avoid")
+    elif raw_score >= SCORE_BUY_THRESHOLD:
+        recommendation = "Buy"
+    elif raw_score >= SCORE_WATCH_THRESHOLD:
+        recommendation = "Watch"
+    else:
+        recommendation = "Avoid"
 
-    # --- Diamond Cross ---
-    if has_diamond:
-        score += W_DIAMOND
-        reasons.append("Diamond Cross (EMA20>EMA50)")
-
-    # --- RSI (dominant signal per optimization) ---
-    if overbought:
-        score -= W_RSI
-        sub_rsi = -W_RSI
-        reasons.append(f"RSI overbought ({rsi:.1f})")
-    elif oversold:
-        score += W_RSI
-        sub_rsi = W_RSI
-        reasons.append(f"RSI oversold ({rsi:.1f})")
-
-    # --- MFI ---
-    if is_mfi_overbought:
-        score -= W_MFI
-        reasons.append(f"MFI overbought ({mfi:.1f})")
-    elif is_mfi_oversold and regime != "bearish":
-        score += W_MFI
-        reasons.append(f"MFI oversold ({mfi:.1f})")
-
-    # --- Volume ---
-    if is_volume_spike:
-        score += W_VOLUME
-        sub_volume = W_VOLUME
-
-    # --- ADL ---
-    if is_accumulating:
-        score += W_ADI
-        sub_adi = W_ADI
-        reasons.append("accumulation (ADL positive)")
-    elif is_distributing:
-        score -= W_ADI
-        sub_adi = -W_ADI
-        reasons.append("distribution (ADL negative)")
-
-    # Store raw score for percentile ranking
-    raw_score = score
-
-    # === RECOMMENDATION (will be overridden by percentile post-processing) ===
-    # Placeholder — actual recommendation assigned after all stocks scored
-    recommendation = "Hold"
     basis = ", ".join(reasons) if reasons else "no signals triggered"
+    basis = f"{basis}; score={raw_score:.1f}/100"
 
     # === ENTRY PRICE ===
     if USE_ENHANCED_ENTRY and ind and len(ind) > 0:
@@ -1518,19 +1651,13 @@ def build_enhanced_recommendation_and_entry(
         tp1_rr = tp2_rr = tp3_rr = None
         tp1_reward_pct = tp2_reward_pct = tp3_reward_pct = None
 
-    basis = ", ".join(reasons) if reasons else "no signals triggered"
     basis = f"{basis}; entry: {entry_basis}" if entry_basis else basis
 
     return {
         "recommendation": recommendation,
         "recommendation_basis": basis,
         "raw_score": round(raw_score, 2),
-        "sub_trend": round(sub_trend, 2),
-        "sub_macd": round(sub_macd, 2),
-        "sub_rsi": round(sub_rsi, 2),
-        "sub_volume": round(sub_volume, 2),
-        "sub_adi": round(sub_adi, 2),
-        "sub_support": round(sub_support, 2),
+        "score_breakdown": score_breakdown,
         "optimal_entry_price": round(entry_price, 4) if entry_price is not None else None,
         "stop_loss": round(stop_loss, 4) if stop_loss is not None else None,
         "stop_loss_basis": stop_loss_basis,
@@ -1555,7 +1682,7 @@ def build_enhanced_recommendation_and_entry(
 # stays lightweight even after a year+ of daily runs).
 HISTORY_COLUMNS = [
     "Analysis Run Date", "Selected Stock", "Index Membership", "Current EGP Price", "Recommendation",
-    "Score", "Score %", "Score - Trend", "Score - MACD", "Score - RSI", "Score - Volume", "Score - ADI", "Score - Support",
+    "Score", "Score - Trend", "Score - MACD", "Score - RSI", "Score - Volume", "Score - ADI", "Score - Support",
     "Undervalued (Yes/No)", "Implied Fair Value (EGP)", "Fair Value Method",
     "Golden Cross (Yes/No)", "Death Cross (Yes/No)",
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)",
@@ -1802,6 +1929,9 @@ def run(input_path: str, output_path: str) -> None:
             adx, adx_plus, adx_minus,
             mfi, adl, bb_squeeze,
             vwma, macd_bullish,
+            ema20, ema50, ema200,
+            vol.get("vol_multiplier"),
+            macd, macd_signal,
         )
 
         rows.append({
@@ -1865,12 +1995,12 @@ def run(input_path: str, output_path: str) -> None:
             "Recommendation": rec["recommendation"],
             "Recommendation Basis": rec["recommendation_basis"],
             "Score": rec["raw_score"],
-            "Score - Trend": rec["sub_trend"],
-            "Score - MACD": rec["sub_macd"],
-            "Score - RSI": rec["sub_rsi"],
-            "Score - Volume": rec["sub_volume"],
-            "Score - ADI": rec["sub_adi"],
-            "Score - Support": rec["sub_support"],
+            "Score - Trend": rec["score_breakdown"]["trend"],
+            "Score - MACD": rec["score_breakdown"]["macd"],
+            "Score - RSI": rec["score_breakdown"]["rsi"],
+            "Score - Volume": rec["score_breakdown"]["volume"],
+            "Score - ADI": rec["score_breakdown"]["adi"],
+            "Score - Support": rec["score_breakdown"]["support"],
             "ChartScanAI Signal": cs_signal,
             "ChartScanAI Recommendation": cs_recommendation,
             "ChartScanAI Confidence": round(cs_confidence, 4) if cs_confidence is not None else None,
@@ -1883,41 +2013,10 @@ def run(input_path: str, output_path: str) -> None:
 
     out_df = pd.DataFrame(rows)
 
-    # === OPTIMIZED SCORE-BASED RECOMMENDATION ===
-    # Compute % of max achievable score and assign Buy/Watch/Avoid
-    if "Score" in out_df.columns and len(out_df) > 1:
-        scores = out_df["Score"]
-
-        # Max achievable score: sum of all positive signal weights
-        # GC(5) + NearSupport(8.3) + VWMA(0.5) + MACD(11.7) + Diamond(5)
-        # + RSI_Oversold(39.7) + MFI_Oversold(10) + VolumeSpike(18.6) + ADL_Acc(16.7) = 115.5
-        MAX_SCORE = W_TREND + W_SUPPORT + W_VWMA + W_MACD + W_DIAMOND + W_RSI + W_MFI + W_VOLUME + W_ADI
-
-        # Score as percentage of maximum (0-100%)
-        out_df["Score %"] = ((scores / MAX_SCORE) * 100).round(1)
-
-        def _assign_rec(row):
-            # Death Cross always Avoid regardless of score
-            if row.get("Death Cross (Yes/No)") == "Yes":
-                return "Avoid"
-            pct = row["Score %"]
-            if pct >= BUY_THRESHOLD_PCT:
-                return "Buy"
-            elif pct >= WATCH_THRESHOLD_PCT:
-                return "Watch"
-            else:
-                return "Avoid"
-
-        out_df["Recommendation"] = out_df.apply(_assign_rec, axis=1)
-
-        # Update basis to include score info
-        for i, row in out_df.iterrows():
-            old_basis = row.get("Recommendation Basis", "")
-            score_info = f"score={row['Score']:.1f}/{MAX_SCORE:.0f} ({row['Score %']:.0f}%)"
-            out_df.at[i, "Recommendation Basis"] = f"{old_basis}; {score_info}"
-
-        log.info("Score-based recommendations: max=%.1f, buy>=%.0f%%, watch>=%.0f%%",
-                 MAX_SCORE, BUY_THRESHOLD_PCT, WATCH_THRESHOLD_PCT)
+    # Recommendation and Score are now assigned per-stock, directly out of
+    # 100, inside build_enhanced_recommendation_and_entry() - no batch-wide
+    # percentile step needed (see SCORE_BUY_THRESHOLD / SCORE_WATCH_THRESHOLD).
+    if "Score" in out_df.columns:
         log.info("Recommendations: %s", out_df["Recommendation"].value_counts().to_dict())
 
     log.info("Fetching EGX index snapshot (EGX30/EGX70/EGX33)...")
