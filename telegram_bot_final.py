@@ -1077,7 +1077,16 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         keyboard.append(row)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=reply_markup)
+    full_text = "\n".join(lines)
+    chunk_size = 3500
+    chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)] or [""]
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        markup = reply_markup if is_last else None
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            await update.message.reply_text(chunk, reply_markup=markup)
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the GitHub URL for the Excel report."""
