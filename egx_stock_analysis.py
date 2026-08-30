@@ -1363,16 +1363,25 @@ def score_trend(
 
 
 def score_macd(macd: Optional[float], macd_signal: Optional[float]) -> Tuple[float, List[str]]:
+    """Momentum: MACD bullish signal - weight = SCORE_WEIGHT_MACD (15%).
+
+    Scaled by histogram magnitude: (MACD - signal) / |signal| to capture
+    how strong the bullish momentum is, not just direction.
+    """
     reasons: List[str] = []
     if macd is None or macd_signal is None:
         return 0.0, reasons
 
     score = 0.0
     if macd > macd_signal:
-        score += 0.5
-        reasons.append("MACD line above signal (bullish)")
+        # Scale by histogram magnitude relative to signal line
+        hist = macd - macd_signal
+        mag = abs(macd_signal) if macd_signal != 0 else 1.0
+        strength = min(1.0, abs(hist) / mag)  # 0-1 normalized strength
+        score = 0.4 + 0.6 * strength  # 0.4 base + up to 0.6 for strong momentum
+        reasons.append(f"MACD bullish (strength {strength:.0%})")
         if macd > 0:
-            score += 0.5
+            score = min(1.0, score + 0.1)
             reasons.append("MACD above zero (confirmed momentum)")
     else:
         reasons.append("MACD below signal (bearish)")
@@ -1381,11 +1390,16 @@ def score_macd(macd: Optional[float], macd_signal: Optional[float]) -> Tuple[flo
 
 
 def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[str]]:
+    """Momentum/overbought-oversold: RSI(14) - weight = SCORE_WEIGHT_RSI (15%).
+
+    Smooth gradient: healthy zone gets full marks, overbought gets a moderate
+    penalty (not zero), oversold gets bonus for reversal potential.
+    Strong trend (ADX) reduces overbought penalty.
+    """
     reasons: List[str] = []
     if rsi is None:
         return 0.0, reasons
 
-    # Normalized 0.0 to 1.0 scale (No negative penalties)
     if 50 <= rsi <= 70:
         score = 1.0
         reasons.append(f"RSI in healthy bullish zone ({rsi:.1f})")
@@ -1395,10 +1409,17 @@ def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[s
     elif rsi < 40:
         score = 0.8 if rsi <= RSI_OVERSOLD else 0.4
         reasons.append(f"RSI oversold, potential reversal ({rsi:.1f})")
-    elif rsi <= 80:
+    elif rsi <= 75:
+        # Mild overbought — still in acceptable range
         strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
-        score = 0.5 if strong_trend else 0.1
-        note = " (strong trend, score maintained)" if strong_trend else ""
+        score = 0.5 if strong_trend else 0.25
+        note = " (strong trend maintained)" if strong_trend else ""
+        reasons.append(f"RSI mildly overbought ({rsi:.1f}){note}")
+    elif rsi <= 85:
+        # Clear overbought — penalty reduced by trend
+        strong_trend = adx is not None and adx >= ADX_TREND_THRESHOLD
+        score = 0.35 if strong_trend else 0.1
+        note = " (strong trend, penalty reduced)" if strong_trend else ""
         reasons.append(f"RSI overbought ({rsi:.1f}){note}")
     else:
         score = 0.0
@@ -1408,58 +1429,102 @@ def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[s
 
 
 def score_volume(vol_multiplier: Optional[float], buy_vol_multiplier: Optional[float]) -> Tuple[float, List[str]]:
+    """Volume confirmation: relative volume + buy-volume multiplier/surge -
+    weight = SCORE_WEIGHT_VOLUME (15%).
+
+    Linear interpolation between thresholds for smooth scaling instead of
+    step-function cliffs.
+    """
     reasons: List[str] = []
     score = 0.0
 
     if vol_multiplier is not None:
-        if vol_multiplier >= 2.0:
-            score += 0.6
-            reasons.append(f"volume surge ({vol_multiplier:.2f}x average)")
+        if vol_multiplier >= 3.0:
+            vol_score = 1.0
+        elif vol_multiplier >= 2.0:
+            vol_score = 0.6 + 0.4 * (vol_multiplier - 2.0)  # 0.6 to 1.0
         elif vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
-            score += 0.4
-            reasons.append(f"above-average volume ({vol_multiplier:.2f}x)")
+            vol_score = 0.3 + 0.3 * (vol_multiplier - VOLUME_SPIKE_MULTIPLIER) / (2.0 - VOLUME_SPIKE_MULTIPLIER)
         elif vol_multiplier >= 1.0:
-            score += 0.1
+            vol_score = 0.1 * (vol_multiplier - 1.0) / (VOLUME_SPIKE_MULTIPLIER - 1.0)
+        else:
+            vol_score = 0.0
+        score += vol_score
+        if vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
+            reasons.append(f"volume {vol_multiplier:.2f}x average")
 
     if buy_vol_multiplier is not None:
-        if buy_vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
-            score += 0.4
-            reasons.append(f"buy-volume spike ({buy_vol_multiplier:.2f}x 2-month avg)")
+        if buy_vol_multiplier >= 3.0:
+            buy_score = 1.0
+        elif buy_vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
+            buy_score = 0.3 + 0.7 * (buy_vol_multiplier - VOLUME_SPIKE_MULTIPLIER) / (3.0 - VOLUME_SPIKE_MULTIPLIER)
         elif buy_vol_multiplier >= 1.0:
-            score += 0.1
+            buy_score = 0.1 * (buy_vol_multiplier - 1.0) / (VOLUME_SPIKE_MULTIPLIER - 1.0)
+        else:
+            buy_score = 0.0
+        score += buy_score
+        if buy_vol_multiplier >= VOLUME_SPIKE_MULTIPLIER:
+            reasons.append(f"buy-volume spike ({buy_vol_multiplier:.2f}x)")
 
     return min(1.0, max(0.0, score)), reasons
 
 
 def score_adi(adl: Optional[float], mfi: Optional[float]) -> Tuple[float, List[str]]:
+    """Volume flow: Accumulation/Distribution Line, with MFI as supporting
+    confirmation - weight = SCORE_WEIGHT_ADI (12.5%).
+
+    No neutral baseline — starts at 0 and scales up/down based on actual
+    accumulation/distribution signals.
+    """
     reasons: List[str] = []
-    score = 0.5  # Neutral baseline
+    score = 0.0
 
     if adl is not None:
         if adl > 0:
-            score += 0.3
+            score += 0.5
             reasons.append("accumulation (ADL positive)")
         elif adl < 0:
-            score -= 0.3
+            score -= 0.5
             reasons.append("distribution (ADL negative)")
 
     if mfi is not None:
         if mfi <= MFI_OVERSOLD:
-            score += 0.2
+            score += 0.3
             reasons.append(f"MFI oversold ({mfi:.1f})")
         elif mfi >= MFI_OVERBOUGHT:
-            score -= 0.2
+            score -= 0.3
             reasons.append(f"MFI overbought ({mfi:.1f})")
+        elif 40 <= mfi <= 60:
+            score += 0.1  # mild positive for healthy MFI
 
     return min(1.0, max(0.0, score)), reasons
 
 
-def score_support(is_near_support: bool, volume_confirmed: bool) -> Tuple[float, List[str]]:
+def score_support(is_near_support: bool, volume_confirmed: bool,
+                  current_price: Optional[float] = None,
+                  support: Optional[float] = None) -> Tuple[float, List[str]]:
+    """Support/structure: price near/bouncing off a clear support level, with
+    volume confirmation - weight = SCORE_WEIGHT_SUPPORT (12.5%).
+
+    Gradual scaling: closer to support = higher score. Volume confirmation
+    adds bonus.
+    """
     if not is_near_support:
         return 0.0, []
+
+    # Gradual scaling based on distance to support
+    if current_price is not None and support is not None and support > 0:
+        distance_pct = (current_price - support) / support
+        # Within 3% of support: linear scale from 0.3 (at 3%) to 1.0 (at 0%)
+        proximity_score = max(0.3, 1.0 - (distance_pct / NEAR_SUPPORT_PCT) * 0.7)
+    else:
+        proximity_score = 0.6
+
     if volume_confirmed:
-        return 1.0, ["support bounce confirmed by volume"]
-    return 0.6, ["price near support"]
+        proximity_score = min(1.0, proximity_score + 0.2)
+        return proximity_score, ["support bounce confirmed by volume"]
+
+    return proximity_score, ["price near support"]
 
 
 # --------------------------------------------------------------------------
@@ -1527,7 +1592,7 @@ def build_enhanced_recommendation_and_entry(
     rsi_val, rsi_reasons = score_rsi(rsi, adx)
     volume_val, volume_reasons = score_volume(vol_multiplier, buy_multiplier)
     adi_val, adi_reasons = score_adi(adl, mfi)
-    support_val, support_reasons = score_support(is_near_support, is_volume_spike)
+    support_val, support_reasons = score_support(is_near_support, is_volume_spike, current_price, support)
 
     # Convert 0.0-1.0 ratios into final weighted score out of 100
     trend_pts = trend_val * SCORE_WEIGHT_TREND
