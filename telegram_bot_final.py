@@ -1007,7 +1007,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         entries.sort(key=_sort_key, reverse=True)
 
         emoji, title = section_meta[category]
-        lines.append(f"{emoji} *{title}* ({len(entries)})")
+        title_suffix = " (Confirmed by one method)" if category == "Buy" else ""
+        lines.append(f"{emoji} *{title}*{title_suffix} ({len(entries)})")
         for row, note in entries:
             ticker = row.get("Selected Stock", "?")
             price = row.get("Current EGP Price")
@@ -1018,19 +1019,18 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
             except (ValueError, TypeError):
                 score_str = ""
-            note_str = f" ({note})" if note else ""
-            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}{note_str}")
+            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}")   # note_str dropped
         lines.append("")
 
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
-    lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
-    lines.append("🟢 Buy = only ONE method says Buy (conflict shown in parentheses)")
+    lines.append("🔥 Strong Buy (Confirmed by two methods)")
+    lines.append("🟢 Buy (Confirmed by one method)")
     lines.append("🔴 Avoid = no Buy signal from either method")
 
     # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
     acc_entries = []
-    for cat in ["Strong Buy", "Buy", "Watch"]:
+    for cat in ["Strong Buy", "Buy"]:
         for row, note in buckets.get(cat, []):
             adl = row.get("ADL")
             try:
