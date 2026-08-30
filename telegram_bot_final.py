@@ -1019,22 +1019,22 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 score_str = f" | Score: {float(score):.0f}/100" if score is not None else ""
             except (ValueError, TypeError):
                 score_str = ""
-            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}")   # note_str dropped
+            lines.append(f"  • {ticker} @ {price_str} EGP {diamond}{score_str}")
         lines.append("")
 
     lines.append("_Click a button to analyze any ticker!_")
     lines.append("")
-    lines.append("🔥 Strong Buy (Confirmed by two methods)")
-    lines.append("🟢 Buy (Confirmed by one method)")
+    lines.append("🔥 Strong Buy = base indicators + ChartScanAI both say Buy")
+    lines.append("🟢 Buy (Confirmed by one method) = only ONE method says Buy")
     lines.append("🔴 Avoid = no Buy signal from either method")
 
-    # === ACCUMULATION SECTION: Buy/Watch stocks with ADL > 0 ===
+    # === ACCUMULATION SECTION: Buy stocks with ADL > 0 (Strong Buy/Buy only) ===
     acc_entries = []
     for cat in ["Strong Buy", "Buy"]:
         for row, note in buckets.get(cat, []):
-            adl = row.get("ADL")
+            adl_trend = row.get("ADL Trend (20d)")
             try:
-                if adl is not None and float(adl) > 0:
+                if adl_trend is not None and float(adl_trend) > 0:
                     acc_entries.append((row, note, cat))
             except (ValueError, TypeError):
                 pass
@@ -1077,16 +1077,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         keyboard.append(row)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    full_text = "\n".join(lines)
-    chunk_size = 3500
-    chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)] or [""]
-    for i, chunk in enumerate(chunks):
-        is_last = (i == len(chunks) - 1)
-        markup = reply_markup if is_last else None
-        try:
-            await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=markup)
-        except Exception:
-            await update.message.reply_text(chunk, reply_markup=markup)
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=reply_markup)
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the GitHub URL for the Excel report."""
