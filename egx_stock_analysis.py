@@ -58,7 +58,7 @@ STALE_DATA_WARNING_DAYS = 4
 FX_TICKER = "EGP=X"
 EGP_SIMILARITY_BAND = 0.03
 SWING_ORDER = 5
-SR_LOOKBACK_DAYS = 180
+SR_LOOKBACK_DAYS = 41   # v3 optimized
 
 SMA_SHORT_WINDOW = 50
 SMA_LONG_WINDOW = 200
@@ -80,11 +80,13 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 80.54      # Optimized
-RSI_OVERSOLD = 32.83        # Optimized
+RSI_OVERBOUGHT = 88.04      # v3 optimized
+RSI_OVERSOLD = 27.65        # v3 optimized
+RSI_HEALTHY_LOW = 54.58     # v3 optimized
+RSI_HEALTHY_HIGH = 68.22    # v3 optimized
 
-VOLUME_SPIKE_MULTIPLIER = 1.96  # Optimized
-NEAR_SUPPORT_PCT = 0.03         # Optimized
+VOLUME_SPIKE_MULTIPLIER = 1.95  # v3 optimized
+NEAR_SUPPORT_PCT = 0.0551       # v3 optimized (5.51%)
 BUY_VOL_AVG_DAYS = 42          # 2-month (trading days) for buy volume average
 
 # --- Optimized indicator thresholds ---
@@ -96,20 +98,19 @@ MFI_OVERSOLD = 20              # MFI < 20 = oversold
 # Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
 # ChartScanAI stays a fully separate, secondary signal (own columns) and never
 # feeds into this score. Weights sum to exactly 100.
-SCORE_WEIGHT_TREND = 30.00     # Trend (30%): EMA50/EMA200 alignment is the primary driver
-SCORE_WEIGHT_MACD = 15.00      # Momentum (15%): MACD confirms trend direction and strength
-SCORE_WEIGHT_RSI = 15.00       # Momentum (15%): RSI flags extremes (reduced from 45% to prevent false reversals)
-SCORE_WEIGHT_VOLUME = 15.00    # Volume (15%): Breakouts and moves require volume confirmation
-SCORE_WEIGHT_ADI = 12.5       # Volume flow (12.5%): ADL/MFI tracks institutional accumulation/distribution
-SCORE_WEIGHT_SUPPORT = 12.5   # Support/structure (12.5%): Rewards proximity to safe entry levels
+SCORE_WEIGHT_TREND = 17.77     # v3 normalized
+SCORE_WEIGHT_MACD = 14.24      # v3 normalized
+SCORE_WEIGHT_RSI = 19.18       # v3 normalized
+SCORE_WEIGHT_VOLUME = 16.73    # v3 normalized
+SCORE_WEIGHT_ADI = 18.73       # v3 normalized
+SCORE_WEIGHT_SUPPORT = 13.35   # v3 normalized
 
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
 # Score thresholds (out of 100) for the base recommendation.
-# Adjusted to standard quartiles for technical grading.
-SCORE_BUY_THRESHOLD = 60.00
-SCORE_WATCH_THRESHOLD = 50.00
+SCORE_BUY_THRESHOLD = 72.28    # v3 optimized
+SCORE_WATCH_THRESHOLD = 47.28  # v3 optimized
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
@@ -1099,9 +1100,9 @@ def get_enhanced_stop_loss(
         stop_price, basis = stop_levels[0]
         return stop_price, f"stop at {basis}"
     
-    # Fallback: 5% below entry
-    stop_price = entry_price * 0.95
-    return stop_price, "stop at 5% below entry (default)"
+    # Fallback: ~4.69% below entry (v3 optimized)
+    stop_price = entry_price * (1 - 0.0469)
+    return stop_price, "stop at ~4.69% below entry (default)"
 
 
 # --------------------------------------------------------------------------
@@ -1400,10 +1401,10 @@ def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[s
     if rsi is None:
         return 0.0, reasons
 
-    if 50 <= rsi <= 70:
+    if RSI_HEALTHY_LOW <= rsi <= RSI_HEALTHY_HIGH:
         score = 1.0
         reasons.append(f"RSI in healthy bullish zone ({rsi:.1f})")
-    elif 40 <= rsi < 50:
+    elif 40 <= rsi < RSI_HEALTHY_LOW:
         score = 0.6
         reasons.append(f"RSI neutral-firm ({rsi:.1f})")
     elif rsi < 40:
@@ -1666,8 +1667,8 @@ def build_enhanced_recommendation_and_entry(
         )
     else:
         if entry_price is not None:
-            stop_loss = entry_price * 0.95
-            stop_loss_basis = "stop at 5% below entry (default)"
+            stop_loss = entry_price * (1 - 0.0469)
+            stop_loss_basis = "stop at ~4.69% below entry (default)"
         else:
             stop_loss = None
             stop_loss_basis = "no stop loss (no entry)"
