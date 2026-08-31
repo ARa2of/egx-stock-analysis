@@ -109,8 +109,8 @@ assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
 
 # Score thresholds (out of 100) for the base recommendation.
 # Adjusted using the optimized diagnostic values.
-SCORE_BUY_THRESHOLD = 61
-SCORE_WATCH_THRESHOLD = 47.28348345360217
+SCORE_BUY_THRESHOLD = 51
+SCORE_WATCH_THRESHOLD = 40
 
 # Enhanced entry configuration
 USE_ENHANCED_ENTRY = True       # Set to False to use original logic
