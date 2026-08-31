@@ -81,13 +81,13 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 82.76420968693704       # Optimized (trial 225, obj=0.457) - was 81
-RSI_OVERSOLD = 26.56638727088238         # Optimized (trial 225, obj=0.457) - was 27.647...
+RSI_OVERBOUGHT = 81       # Optimized (trial 225, obj=0.457) - was 81
+RSI_OVERSOLD = 27         # Optimized (trial 225, obj=0.457) - was 27.647...
 
 # RSI "healthy bullish zone" used by score_rsi() for full marks. Previously
 # hardcoded as 45-70 inside the function; now tunable and optimizer-set.
-RSI_HEALTHY_LOW = 52.45948069143653      # Optimized (trial 225, obj=0.457)
-RSI_HEALTHY_HIGH = 65.9223028724959      # Optimized (trial 225, obj=0.457)
+RSI_HEALTHY_LOW = 51     # Optimized (trial 225, obj=0.457)
+RSI_HEALTHY_HIGH = 66      # Optimized (trial 225, obj=0.457)
 
 VOLUME_SPIKE_MULTIPLIER = 1.5440262839471588  # Optimized (trial 225, obj=0.457) - was 1.9538...
 NEAR_SUPPORT_PCT = 0.029465586420376083       # Optimized (trial 225, obj=0.457) - was 0.05506...
@@ -117,11 +117,11 @@ ENTRY_BUFFER = 0.0034865417007704713         # Optimized (trial 225, obj=0.457)
 # feeds into this score. Weights sum to exactly 100 based on normalized weights.
 # Optimized (optimize_base_score_cached.py, trial 225, obj=0.457) - raw optuna
 # weights (7.66/13.13/34.68/22.51/26.78/21.01) renormalized to sum to 100.
-SCORE_WEIGHT_TREND = 6.090333902071737      # Trend (6.09%): EMA50/EMA200 alignment
+SCORE_WEIGHT_TREND = 10.090333902071737      # Trend (10.09%): EMA50/EMA200 alignment
 SCORE_WEIGHT_MACD = 10.440349563613843      # Momentum (10.44%): MACD confirms direction
 SCORE_WEIGHT_RSI = 27.57543028546996        # Momentum (27.58%): RSI flags extremes
 SCORE_WEIGHT_VOLUME = 17.895753827202814    # Volume (17.90%): Breakout confirmation
-SCORE_WEIGHT_ADI = 21.294113808533517       # Volume flow (21.29%): ADL/MFI tracks flow
+SCORE_WEIGHT_ADI = 17.294113808533517       # Volume flow (17.29%): ADL/MFI tracks flow
 SCORE_WEIGHT_SUPPORT = 16.704018613108136   # Support/structure (16.70%): Safe entry levels
 
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
@@ -130,7 +130,7 @@ assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
 # Score thresholds (out of 100) for the base recommendation.
 # Optimized (trial 225, obj=0.457) - was 51. WATCH_THRESHOLD left as-is; the
 # optimizer only tunes the buy threshold.
-SCORE_BUY_THRESHOLD = 55
+SCORE_BUY_THRESHOLD = 51
 SCORE_WATCH_THRESHOLD = 40
 
 # Enhanced entry configuration
