@@ -59,7 +59,7 @@ STALE_DATA_WARNING_DAYS = 4
 FX_TICKER = "EGP=X"
 EGP_SIMILARITY_BAND = 0.03
 SWING_ORDER = 5
-SR_LOOKBACK_DAYS = 180
+SR_LOOKBACK_DAYS = 38   # Optimized (optimize_base_score_cached.py, trial 225, obj=0.457) - was 180
 
 SMA_SHORT_WINDOW = 50
 SMA_LONG_WINDOW = 200
@@ -81,11 +81,16 @@ HISTORY_ARCHIVE_COLUMNS = [
     "Diamond Cross (20>50) (Yes/No)", "RSI (%)", "Support", "Resistance",
 ]
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 81       # Optimized[cite: 3]
-RSI_OVERSOLD = 27.647146501645125        # Optimized[cite: 3]
+RSI_OVERBOUGHT = 82.76420968693704       # Optimized (trial 225, obj=0.457) - was 81
+RSI_OVERSOLD = 26.56638727088238         # Optimized (trial 225, obj=0.457) - was 27.647...
 
-VOLUME_SPIKE_MULTIPLIER = 1.9538223538123156  # Optimized[cite: 3]
-NEAR_SUPPORT_PCT = 0.05506615218534689          # Optimized[cite: 3]
+# RSI "healthy bullish zone" used by score_rsi() for full marks. Previously
+# hardcoded as 45-70 inside the function; now tunable and optimizer-set.
+RSI_HEALTHY_LOW = 52.45948069143653      # Optimized (trial 225, obj=0.457)
+RSI_HEALTHY_HIGH = 65.9223028724959      # Optimized (trial 225, obj=0.457)
+
+VOLUME_SPIKE_MULTIPLIER = 1.5440262839471588  # Optimized (trial 225, obj=0.457) - was 1.9538...
+NEAR_SUPPORT_PCT = 0.029465586420376083       # Optimized (trial 225, obj=0.457) - was 0.05506...
 BUY_VOL_AVG_DAYS = 42                         # 2-month (trading days) for buy volume average
 
 # --- Optimized indicator thresholds ---
@@ -93,23 +98,39 @@ ADX_TREND_THRESHOLD = 25       # ADX > 25 = strong trend
 MFI_OVERBOUGHT = 80            # MFI > 80 = overbought
 MFI_OVERSOLD = 20              # MFI < 20 = oversold
 
+# --- ATR-based risk management (Optimizer-tuned) ---
+# Used as the entry/exit fallback whenever TradingView's own S/R-derived
+# levels aren't available (see get_enhanced_stop_loss / calculate_take_profit_levels).
+STOP_LOSS_ATR_MULT = 2.6748616295775633  # Optimized (trial 225, obj=0.457)
+TARGET_ATR_MULT = 5.403179659781596      # Optimized (trial 225, obj=0.457)
+
+# --- Enhanced entry constraints (Optimizer-tuned) ---
+# MAX_ENTRY_DISCOUNT rejects pullback entry candidates that sit too far below
+# the current price (unrealistic fill); ENTRY_BUFFER nudges the chosen entry
+# slightly above the raw level to improve fill probability.
+MAX_ENTRY_DISCOUNT = 0.1286959078861552      # Optimized (trial 225, obj=0.457)
+ENTRY_BUFFER = 0.0034865417007704713         # Optimized (trial 225, obj=0.457)
+
 # --- Base recommendation scoring weights (0-100 scale) ---
 # Six weighted categories drive the base (non-ChartScanAI) score/recommendation.
 # ChartScanAI stays a fully separate, secondary signal (own columns) and never
 # feeds into this score. Weights sum to exactly 100 based on normalized weights.
-SCORE_WEIGHT_TREND = 18.768704016021527     # Trend (18.77%): EMA50/EMA200 alignment[cite: 3]
-SCORE_WEIGHT_MACD = 14.238912102139023      # Momentum (14.24%): MACD confirms direction[cite: 3]
-SCORE_WEIGHT_RSI = 18.177576820499485       # Momentum (19.18%): RSI flags extremes[cite: 3]
-SCORE_WEIGHT_VOLUME = 16.73304900441024     # Volume (16.73%): Breakout confirmation[cite: 3]
-SCORE_WEIGHT_ADI = 18.731629810886304       # Volume flow (18.73%): ADL/MFI tracks flow[cite: 3]
-SCORE_WEIGHT_SUPPORT = 13.35012824604343    # Support/structure (13.35%): Safe entry levels[cite: 3]
+# Optimized (optimize_base_score_cached.py, trial 225, obj=0.457) - raw optuna
+# weights (7.66/13.13/34.68/22.51/26.78/21.01) renormalized to sum to 100.
+SCORE_WEIGHT_TREND = 6.090333902071737      # Trend (6.09%): EMA50/EMA200 alignment
+SCORE_WEIGHT_MACD = 10.440349563613843      # Momentum (10.44%): MACD confirms direction
+SCORE_WEIGHT_RSI = 27.57543028546996        # Momentum (27.58%): RSI flags extremes
+SCORE_WEIGHT_VOLUME = 17.895753827202814    # Volume (17.90%): Breakout confirmation
+SCORE_WEIGHT_ADI = 21.294113808533517       # Volume flow (21.29%): ADL/MFI tracks flow
+SCORE_WEIGHT_SUPPORT = 16.704018613108136   # Support/structure (16.70%): Safe entry levels
 
 assert abs(SCORE_WEIGHT_TREND + SCORE_WEIGHT_MACD + SCORE_WEIGHT_RSI +
            SCORE_WEIGHT_VOLUME + SCORE_WEIGHT_ADI + SCORE_WEIGHT_SUPPORT - 100) < 0.01
 
 # Score thresholds (out of 100) for the base recommendation.
-# Adjusted using the optimized diagnostic values.
-SCORE_BUY_THRESHOLD = 51
+# Optimized (trial 225, obj=0.457) - was 51. WATCH_THRESHOLD left as-is; the
+# optimizer only tunes the buy threshold.
+SCORE_BUY_THRESHOLD = 55
 SCORE_WATCH_THRESHOLD = 40
 
 # Enhanced entry configuration
@@ -1052,7 +1073,15 @@ def get_enhanced_entry_price(
     # Add swing support if near support
     if is_near_support and sr_support is not None and sr_support < current_price:
         potential_entries.append((sr_support, "Swing Support"))
-    
+
+    # Optimized (trial 225, obj=0.457): drop candidates that sit more than
+    # MAX_ENTRY_DISCOUNT below current price - too deep a pullback to be a
+    # realistic fill target.
+    potential_entries = [
+        (value, label) for value, label in potential_entries
+        if (current_price - value) / current_price <= MAX_ENTRY_DISCOUNT
+    ]
+
     # If no potential entries found, return current price
     if not potential_entries:
         return current_price, "no pullback level identified; current price as reference"
@@ -1082,8 +1111,12 @@ def get_enhanced_entry_price(
         # Default: use the first (lowest) level
         entry_price, basis = potential_entries[0]
         rationale = "no RSI data available"
-    
-    entry_basis = f"enhanced entry at {basis} ({rationale})"
+
+    # Optimized (trial 225, obj=0.457): small buffer above the raw level to
+    # improve fill probability rather than waiting for the exact price.
+    entry_price = entry_price * (1 + ENTRY_BUFFER)
+
+    entry_basis = f"enhanced entry at {basis} ({rationale}), +{ENTRY_BUFFER*100:.2f}% buffer"
     return entry_price, entry_basis
 
 
@@ -1095,7 +1128,8 @@ def get_enhanced_stop_loss(
     ind: dict,
     sr_support: Optional[float],
     entry_price: float,
-    current_price: float
+    current_price: float,
+    atr_val: Optional[float] = None
 ) -> Tuple[float, str]:
     """
     Enhanced stop loss using multiple TradingView indicators.
@@ -1131,9 +1165,14 @@ def get_enhanced_stop_loss(
         stop_price, basis = stop_levels[0]
         return stop_price, f"stop at {basis}"
     
-    # Fallback: 5% below entry
+    # Fallback: ATR-based stop (Optimized, trial 225, obj=0.457) - was a flat
+    # 5% below entry. Falls back to the flat 5% only if ATR is unavailable.
+    if atr_val is not None and atr_val > 0:
+        stop_price = entry_price - STOP_LOSS_ATR_MULT * atr_val
+        return stop_price, f"stop at {STOP_LOSS_ATR_MULT:.2f}x ATR below entry"
+
     stop_price = entry_price * 0.95
-    return stop_price, "stop at 5% below entry (default)"
+    return stop_price, "stop at 5% below entry (default, ATR unavailable)"
 
 
 # --------------------------------------------------------------------------
@@ -1143,7 +1182,8 @@ def get_enhanced_stop_loss(
 def calculate_take_profit_levels(
     ind: dict,
     current_price: float,
-    entry_price: float
+    entry_price: float,
+    atr_val: Optional[float] = None
 ) -> dict:
     """
     Calculate multiple take profit levels using TradingView indicators.
@@ -1200,49 +1240,59 @@ def calculate_take_profit_levels(
             seen_prices.add(rounded)
             unique_levels.append((price, label))
     
+    # ATR-based full target (Optimized, trial 225, obj=0.457): TP3 = entry +
+    # TARGET_ATR_MULT * ATR; TP1/TP2 are 1/3 and 2/3 of that same move. Used
+    # to fill in any level(s) TradingView's indicators didn't provide.
+    has_atr = atr_val is not None and atr_val > 0
+    atr_labels = {}
+    if has_atr:
+        full_move = TARGET_ATR_MULT * atr_val
+        atr_tp1 = entry_price + full_move / 3
+        atr_tp2 = entry_price + full_move * 2 / 3
+        atr_tp3 = entry_price + full_move
+        atr_labels = {1: (atr_tp1, "ATR target (1/3)"), 2: (atr_tp2, "ATR target (2/3)"), 3: (atr_tp3, "ATR target (full)")}
+
     # Select take profit levels
-    if unique_levels:
-        # TP1: First resistance level (most conservative)
+    # TP1: first resistance level, else ATR-based
+    if len(unique_levels) >= 1:
         result["take_profit_1"] = round(unique_levels[0][0], 4)
-        
-        # TP2: Second resistance level (if available)
-        if len(unique_levels) >= 2:
-            result["take_profit_2"] = round(unique_levels[1][0], 4)
-        else:
-            # Fallback: 1.5 * (TP1 - entry) + TP1
-            if entry_price and result["take_profit_1"]:
-                target_move = result["take_profit_1"] - entry_price
-                result["take_profit_2"] = round(result["take_profit_1"] + target_move * 0.5, 4)
-        
-# TP3: Third resistance level or highest available (most aggressive)
-        if len(unique_levels) >= 3:
-            result["take_profit_3"] = round(unique_levels[2][0], 4)
-        elif len(unique_levels) == 2:
-            # Use a Fibonacci extension from R2
-            if result["take_profit_2"] and entry_price:
-                target_move = result["take_profit_2"] - entry_price
-                result["take_profit_3"] = round(result["take_profit_2"] + target_move * 0.618, 4)
-        else:
-            # Use the highest available with a multiplier
-            if unique_levels and entry_price and result["take_profit_2"]:
-                target_move = unique_levels[-1][0] - entry_price
-                # Extend 100% of the initial move from TP1 to create TP3
-                result["take_profit_3"] = round(unique_levels[-1][0] + target_move * 1.0, 4)
-        
-        # Build basis explanation with labels
-        basis_parts = []
-        if result["take_profit_1"]:
-            label = unique_levels[0][1] if unique_levels else "TP1"
-            basis_parts.append(f"TP1: {label} at {round(result['take_profit_1'], 2)}")
-        if result["take_profit_2"]:
-            label = unique_levels[1][1] if len(unique_levels) >= 2 else "Extension"
-            basis_parts.append(f"TP2: {label} at {round(result['take_profit_2'], 2)}")
-        if result["take_profit_3"]:
-            label = unique_levels[2][1] if len(unique_levels) >= 3 else "Extension"
-            basis_parts.append(f"TP3: {label} at {round(result['take_profit_3'], 2)}")
-        
-        result["take_profit_basis"] = "; ".join(basis_parts)
-    
+    elif has_atr:
+        result["take_profit_1"] = round(atr_labels[1][0], 4)
+
+    # TP2: second resistance level, else ATR-based
+    if len(unique_levels) >= 2:
+        result["take_profit_2"] = round(unique_levels[1][0], 4)
+    elif has_atr:
+        result["take_profit_2"] = round(atr_labels[2][0], 4)
+    elif entry_price and result["take_profit_1"]:
+        # Last-resort fallback if ATR is unavailable too
+        target_move = result["take_profit_1"] - entry_price
+        result["take_profit_2"] = round(result["take_profit_1"] + target_move * 0.5, 4)
+
+    # TP3: third resistance level, else ATR-based
+    if len(unique_levels) >= 3:
+        result["take_profit_3"] = round(unique_levels[2][0], 4)
+    elif has_atr:
+        result["take_profit_3"] = round(atr_labels[3][0], 4)
+    elif result["take_profit_2"] and entry_price:
+        # Last-resort fallback if ATR is unavailable too
+        target_move = result["take_profit_2"] - entry_price
+        result["take_profit_3"] = round(result["take_profit_2"] + target_move * 0.618, 4)
+
+    # Build basis explanation with labels
+    basis_parts = []
+    if result["take_profit_1"] is not None:
+        label = unique_levels[0][1] if len(unique_levels) >= 1 else atr_labels.get(1, (None, "Extension"))[1]
+        basis_parts.append(f"TP1: {label} at {round(result['take_profit_1'], 2)}")
+    if result["take_profit_2"] is not None:
+        label = unique_levels[1][1] if len(unique_levels) >= 2 else atr_labels.get(2, (None, "Extension"))[1]
+        basis_parts.append(f"TP2: {label} at {round(result['take_profit_2'], 2)}")
+    if result["take_profit_3"] is not None:
+        label = unique_levels[2][1] if len(unique_levels) >= 3 else atr_labels.get(3, (None, "Extension"))[1]
+        basis_parts.append(f"TP3: {label} at {round(result['take_profit_3'], 2)}")
+
+    result["take_profit_basis"] = "; ".join(basis_parts)
+
     return result
 
 
@@ -1432,7 +1482,7 @@ def score_rsi(rsi: Optional[float], adx: Optional[float]) -> Tuple[float, List[s
     if rsi is None:
         return 0.0, reasons
 
-    if 45 <= rsi <= 70:
+    if RSI_HEALTHY_LOW <= rsi <= RSI_HEALTHY_HIGH:
         score = 1.0
         reasons.append(f"RSI in healthy bullish zone ({rsi:.1f})")
     elif 40 <= rsi < 50:
@@ -1595,6 +1645,7 @@ def build_enhanced_recommendation_and_entry(
     vol_multiplier: Optional[float] = None,
     macd: Optional[float] = None,
     macd_signal: Optional[float] = None,
+    atr_val: Optional[float] = None,
 ) -> dict:
     """
     Base recommendation is driven by the 0-100 weighted scoring rubric
@@ -1700,7 +1751,7 @@ def build_enhanced_recommendation_and_entry(
     # === STOP LOSS ===
     if USE_ENHANCED_ENTRY and entry_price is not None and ind and len(ind) > 0:
         stop_loss, stop_loss_basis = get_enhanced_stop_loss(
-            ind, sr.get("support"), entry_price, current_price
+            ind, sr.get("support"), entry_price, current_price, atr_val=atr_val
         )
     else:
         if entry_price is not None:
@@ -1712,7 +1763,7 @@ def build_enhanced_recommendation_and_entry(
 
     # === TAKE PROFIT LEVELS ===
     if USE_ENHANCED_ENTRY and entry_price is not None and ind and len(ind) > 0:
-        tp_results = calculate_take_profit_levels(ind, current_price, entry_price)
+        tp_results = calculate_take_profit_levels(ind, current_price, entry_price, atr_val=atr_val)
         tp1 = tp_results["take_profit_1"]
         tp2 = tp_results["take_profit_2"]
         tp3 = tp_results["take_profit_3"]
@@ -2017,6 +2068,7 @@ def run(input_path: str, output_path: str) -> None:
             vol_multiplier=vol.get("vol_multiplier"),
             macd=macd, macd_signal=macd_signal,
             adl_trend=adl_trend,
+            atr_val=atr_val,
         )
 
         rows.append({
